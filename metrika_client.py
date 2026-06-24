@@ -36,6 +36,19 @@ HIT_FIELDS = [
 ]
 
 
+def get_metrika_token() -> str | None:
+    """Read the Yandex Metrica token from Streamlit secrets or env vars."""
+    token = os.getenv("YANDEX_METRIKA_TOKEN")
+    if token:
+        return token
+    try:
+        import streamlit as st
+
+        return st.secrets.get("YANDEX_METRIKA_TOKEN")
+    except Exception:
+        return None
+
+
 @dataclass(frozen=True)
 class LogRequestResult:
     request_id: int
@@ -44,9 +57,9 @@ class LogRequestResult:
 
 class MetrikaLogsClient:
     def __init__(self, token: str | None = None, timeout: int = 60) -> None:
-        self.token = token or os.getenv("YANDEX_METRIKA_TOKEN")
+        self.token = token or get_metrika_token()
         if not self.token:
-            raise MetrikaAPIError("Не задана переменная окружения YANDEX_METRIKA_TOKEN")
+            raise MetrikaAPIError("Не задан YANDEX_METRIKA_TOKEN: включен демо-режим")
         self.timeout = timeout
         self.session = requests.Session()
         self.session.headers.update({"Authorization": f"OAuth {self.token}", "Accept-Encoding": "gzip"})

@@ -5,7 +5,8 @@ import datetime as dt
 import pandas as pd
 import streamlit as st
 
-from metrika_client import MetrikaAPIError, MetrikaLogsClient
+from demo_data import build_demo_visits_and_hits
+from metrika_client import MetrikaAPIError, MetrikaLogsClient, get_metrika_token
 from scoring import aggregate_stats, score_sessions
 from summarizer import build_summary
 
@@ -19,8 +20,23 @@ def load_data(counter_id: int, date_from: str, date_to: str) -> tuple[pd.DataFra
     return MetrikaLogsClient().fetch_visits_and_hits(counter_id, date_from, date_to)
 
 
+def load_demo_score(registration_goal_ids: list[str] | None = None) -> pd.DataFrame:
+    visits_df, hits_df = build_demo_visits_and_hits()
+    return score_sessions(visits_df, hits_df, registration_goal_ids or ["1001"])
+
+
 def csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8-sig")
+
+demo_mode = not bool(get_metrika_token())
+if demo_mode:
+    st.warning("Демо-режим: YANDEX_METRIKA_TOKEN не задан, поэтому показаны тестовые данные. Добавьте секрет в Streamlit Community Cloud, чтобы подключить реальные данные.")
+    if "scored" not in st.session_state or not st.session_state.get("demo_mode"):
+        st.session_state["scored"] = load_demo_score()
+    st.session_state["demo_mode"] = True
+else:
+    st.success("Токен Яндекс Метрики найден. Можно загрузить реальные данные из Logs API.")
+    st.session_state["demo_mode"] = False
 
 with st.sidebar:
     st.header("Параметры")
@@ -29,9 +45,16 @@ with st.sidebar:
     date_from = st.date_input("date_from", today - dt.timedelta(days=7))
     date_to = st.date_input("date_to", today - dt.timedelta(days=1))
     reg_goals = st.text_input("ID целей регистрации через запятую", help="Если оставить пустым, любая сессия считается без регистрации для правил регистрации.")
-    load = st.button("Загрузить и посчитать", type="primary")
+    if demo_mode:
+        st.info("Сейчас приложение работает на демо-данных. Поля ниже нужны для реальной Метрики после добавления токена.")
+        load_label = "Обновить демо-данные"
+    else:
+        load_label = "Загрузить и посчитать"
+    load = st.button(load_label, type="primary")
 
-if load:
+if load and demo_mode:
+    st.session_state["scored"] = load_demo_score([x.strip() for x in reg_goals.split(",") if x.strip()] or ["1001"])
+elif load:
     try:
         with st.spinner("Создаем requests в Logs API и скачиваем parts..."):
             visits_df, hits_df = load_data(int(counter_id), str(date_from), str(date_to))
@@ -43,7 +66,7 @@ if load:
 
 scored = st.session_state.get("scored")
 if scored is None:
-    st.info("Введите параметры и нажмите «Загрузить и посчитать». Токен берется из YANDEX_METRIKA_TOKEN.")
+    st.info("Введите параметры и нажмите «Загрузить и посчитать». Если YANDEX_METRIKA_TOKEN не задан, приложение покажет демо-данные.")
     st.stop()
 
 st.subheader("Фильтры")
