@@ -1,0 +1,5 @@
+streamlit>=1.36
+pandas>=2.2
+requests>=2.32
+openai>=1.35
+python-dateutil>=2.9
