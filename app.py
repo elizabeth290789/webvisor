@@ -7,12 +7,12 @@ import streamlit as st
 
 st.set_page_config(page_title="Webvisor Session Triage", layout="wide")
 st.title("Отбор записей Вебвизора для ручного просмотра")
-st.caption("Приложение выгружает visits/hits из Logs API, считает score и помогает выбрать visitID для просмотра в интерфейсе Яндекс Метрики.")
+st.caption("Приложение выгружает visits/hits из Logs API, ищет проблемные сегменты с CR ниже базового уровня и подбирает visitID для просмотра в Вебвизоре.")
 
 try:
     from demo_data import build_demo_visits_and_hits
     from metrika_client import MetrikaAPIError, MetrikaLogsClient, get_metrika_token
-    from scoring import aggregate_stats, analyze_hits, score_sessions
+    from scoring import aggregate_stats, analyze_hits, baseline_metrics, find_problem_segments, score_sessions, select_records_to_watch, webvisor_filter_table
     from summarizer import build_summary
 except Exception as exc:
     st.error("Ошибка при импорте модулей приложения. Проверьте зависимости и конфигурацию деплоя.")
@@ -176,7 +176,7 @@ def main() -> None:
     col1, col2, col3 = st.columns(3)
     with col1:
         device_filter = st.selectbox("Устройство", ["Все", "mobile", "desktop", "tablet"])
-        no_reg_only = st.checkbox("Только без регистрации", value=True)
+        no_reg_only = st.checkbox("Только без регистрации", value=False, help="Для поиска проблемных сегментов лучше оставить всю выборку, чтобы корректно считать CR.")
     with col2:
         filter_hits_loaded = not st.session_state.get("hits", pd.DataFrame()).empty
         current_scope = st.session_state.get("url_search_scope", URL_SEARCH_OPTIONS[DEFAULT_URL_SEARCH_LABEL])
@@ -198,7 +198,7 @@ def main() -> None:
             st.warning("Поиск по любому URL внутри визита доступен только при включенной загрузке hits.")
         utm_contains = st.text_input("UTM campaign содержит")
     with col3:
-        min_score = st.slider("score больше N", 0, 100, 40)
+        min_segment_visits = st.number_input("минимум визитов в сегменте", min_value=1, value=3)
         min_duration = st.number_input("длительность больше N секунд", min_value=0, value=0)
 
     filtered = scored.copy()
@@ -215,12 +215,26 @@ def main() -> None:
         )
     if utm_contains and "UTMCampaign" in filtered:
         filtered = filtered[filtered["UTMCampaign"].astype(str).str.contains(utm_contains, case=False, na=False)]
-    filtered = filtered[(filtered["score"] >= min_score) & (pd.to_numeric(filtered.get("visitDuration", 0), errors="coerce").fillna(0) >= min_duration)]
+    filtered = filtered[(pd.to_numeric(filtered.get("visitDuration", 0), errors="coerce").fillna(0) >= min_duration)]
 
-    top_sessions = filtered.sort_values("score", ascending=False).head(20)
+    baseline = baseline_metrics(filtered)
+    problem_segments = find_problem_segments(filtered, int(min_segment_visits))
+    records_to_watch = select_records_to_watch(filtered, problem_segments)
 
-    st.subheader("Короткий вывод")
-    st.markdown(build_summary(top_sessions, filtered))
+    st.subheader("Базовый CR выбранной выборки")
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("total visits", int(baseline["total_visits"]))
+    m2.metric("registrations", int(baseline["registrations"]))
+    m3.metric("registration CR", f"{baseline['registration_cr'] * 100:.2f}%")
+    m4.metric("avg visitDuration", f"{baseline['avg_visitDuration']:.1f} сек")
+    m5.metric("avg pageViews", f"{baseline['avg_pageViews']:.1f}")
+
+    st.subheader("Главный вывод")
+    st.markdown(build_summary(problem_segments, filtered))
+
+    st.subheader("Проблемные сегменты")
+    st.dataframe(problem_segments, use_container_width=True, hide_index=True)
+    st.download_button("CSV: проблемные сегменты", csv_bytes(problem_segments), "problem_segments.csv", "text/csv")
 
     st.subheader("Группировки")
     stats = aggregate_stats(filtered)
@@ -228,16 +242,20 @@ def main() -> None:
         with st.expander(title, expanded=title in {"По устройствам", "deviceCategory × UTMCampaign"}):
             st.dataframe(table, use_container_width=True, hide_index=True)
 
-    st.subheader("Сессии для просмотра в Вебвизоре")
+    st.subheader("Записи для просмотра")
     show_cols = [c for c in [
-        "priority_rank", "score", "visitID", "dateTime", "deviceCategory", "startURL", "endURL",
-        "visitDuration", "pageViews", "goalsID", "UTMSource", "UTMCampaign", "reason_to_watch"
-    ] if c in top_sessions]
-    st.dataframe(top_sessions[show_cols], use_container_width=True, hide_index=True)
-    st.download_button("CSV: top-20 visitID для просмотра", csv_bytes(top_sessions[show_cols]), "webvisor_top_20_sessions.csv", "text/csv")
+        "segment_name", "priority_score", "visitID", "dateTime", "deviceCategory", "UTMSource", "UTMCampaign", "startURL", "endURL",
+        "visitDuration", "pageViews", "goalsID", "reason_to_watch"
+    ] if c in records_to_watch]
+    st.dataframe(records_to_watch[show_cols] if show_cols else records_to_watch, use_container_width=True, hide_index=True)
+    st.download_button("CSV: записи для просмотра", csv_bytes(records_to_watch[show_cols] if show_cols else records_to_watch), "webvisor_records_to_watch.csv", "text/csv")
+
+    st.subheader("Что фильтровать в Вебвизоре")
+    webvisor_filters = webvisor_filter_table(records_to_watch)
+    st.dataframe(webvisor_filters, use_container_width=True, hide_index=True)
 
     st.subheader("Анализ hits")
-    hits_analysis = analyze_hits(st.session_state.get("hits", pd.DataFrame()))
+    hits_analysis = analyze_hits(st.session_state.get("hits", pd.DataFrame()), filtered)
     if "warning" in hits_analysis:
         st.warning(str(hits_analysis["warning"]))
     else:
@@ -247,9 +265,17 @@ def main() -> None:
             st.dataframe(hits_analysis["per_visit"], use_container_width=True, hide_index=True)
             st.caption("Какие URL чаще встречаются в цепочке")
             st.dataframe(hits_analysis["url_freq"], use_container_width=True, hide_index=True)
+            st.caption("Самые частые цепочки URL у неконвертеров")
+            st.dataframe(hits_analysis.get("nonconverter_chains", pd.DataFrame()), use_container_width=True, hide_index=True)
+            st.caption("Цепочки URL у конвертеров")
+            st.dataframe(hits_analysis.get("converter_chains", pd.DataFrame()), use_container_width=True, hide_index=True)
         with c_hits2:
             st.caption("Где пользователи уходят")
             st.dataframe(hits_analysis["exits"], use_container_width=True, hide_index=True)
+            st.caption("EndURL у визитов без регистрации")
+            st.dataframe(hits_analysis.get("nonconverter_end_urls", pd.DataFrame()), use_container_width=True, hide_index=True)
+            st.caption("Куда уходят после выбранных URL входа")
+            st.dataframe(hits_analysis.get("after_selected_url", pd.DataFrame()), use_container_width=True, hide_index=True)
             st.caption("Цели/события в hits")
             event_freq = hits_analysis.get("event_freq", pd.DataFrame())
             if isinstance(event_freq, pd.DataFrame) and not event_freq.empty:
@@ -260,7 +286,7 @@ def main() -> None:
     st.subheader("Экспорт")
     c1, c2, c3 = st.columns(3)
     with c1:
-        st.download_button("CSV: top проблемных", csv_bytes(filtered.sort_values("score", ascending=False).head(200)), "top_problem_visits.csv", "text/csv")
+        st.download_button("CSV: проблемные сегменты", csv_bytes(problem_segments), "problem_segments_export.csv", "text/csv")
     with c2:
         st.download_button("CSV: все визиты со score", csv_bytes(scored), "all_scored_visits.csv", "text/csv")
     with c3:
