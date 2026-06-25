@@ -214,11 +214,165 @@ def aggregate_stats(scored: pd.DataFrame) -> dict[str, pd.DataFrame]:
     }
 
 
-def analyze_hits(hits: pd.DataFrame) -> dict[str, pd.DataFrame | str]:
+
+def baseline_metrics(scored: pd.DataFrame) -> dict[str, float]:
+    """Return baseline metrics for the currently selected visit sample."""
+    if scored.empty:
+        return {"total_visits": 0, "registrations": 0, "registration_cr": 0.0, "avg_visitDuration": 0.0, "avg_pageViews": 0.0}
+    registered = scored.get("registered", pd.Series(False, index=scored.index)).astype(bool)
+    duration = _numeric(scored.get("visitDuration"), scored.index)
+    page_views = _numeric(scored.get("pageViews"), scored.index)
+    total = int(len(scored))
+    regs = int(registered.sum())
+    return {
+        "total_visits": total,
+        "registrations": regs,
+        "registration_cr": float(regs / total) if total else 0.0,
+        "avg_visitDuration": float(duration.mean()) if total else 0.0,
+        "avg_pageViews": float(page_views.mean()) if total else 0.0,
+    }
+
+
+SEGMENT_DEFINITIONS: list[tuple[str, list[str]]] = [
+    ("deviceCategory", ["deviceCategory"]),
+    ("UTMSource", ["UTMSource"]),
+    ("UTMCampaign", ["UTMCampaign"]),
+    ("startURL", ["start_path"]),
+    ("endURL", ["end_path"]),
+    ("deviceCategory × UTMSource", ["deviceCategory", "UTMSource"]),
+    ("deviceCategory × UTMCampaign", ["deviceCategory", "UTMCampaign"]),
+    ("startURL × deviceCategory", ["start_path", "deviceCategory"]),
+]
+
+
+def _prepare_segment_frame(scored: pd.DataFrame) -> pd.DataFrame:
+    df = scored.copy()
+    if df.empty:
+        return df
+    df["deviceCategory"] = _text_series(df, "deviceCategory", "unknown").map(normalize_device)
+    df["UTMSource"] = _text_series(df, "UTMSource").replace("", "(not set)")
+    df["UTMCampaign"] = _text_series(df, "UTMCampaign").replace("", "(not set)")
+    df["start_path"] = _text_series(df, "startURL").map(_path).replace("", "(empty)")
+    df["end_path"] = _text_series(df, "endURL").map(_path).replace("", "(empty)")
+    df["visitDuration"] = _numeric(df.get("visitDuration"), df.index)
+    df["pageViews"] = _numeric(df.get("pageViews"), df.index)
+    df["registered"] = df.get("registered", pd.Series(False, index=df.index)).astype(bool)
+    return df
+
+
+def find_problem_segments(scored: pd.DataFrame, min_visits: int | None = None) -> pd.DataFrame:
+    """Find segments whose registration CR is worse than the selected sample baseline."""
+    df = _prepare_segment_frame(scored)
+    if df.empty:
+        return pd.DataFrame()
+    base = baseline_metrics(df)
+    baseline_cr = base["registration_cr"]
+    avg_duration = base["avg_visitDuration"]
+    avg_pageviews = base["avg_pageViews"]
+    total_visits = max(int(base["total_visits"]), 1)
+    min_visits = min_visits if min_visits is not None else max(3, int(total_visits * 0.02))
+    rows: list[pd.DataFrame] = []
+    for segment_type, cols in SEGMENT_DEFINITIONS:
+        if any(col not in df for col in cols):
+            continue
+        g = df.groupby(cols, dropna=False).agg(
+            visits=("visitID", "count"),
+            registrations=("registered", "sum"),
+            avg_visitDuration=("visitDuration", "mean"),
+            avg_pageViews=("pageViews", "mean"),
+        ).reset_index()
+        g["segment_type"] = segment_type
+        g["segment_name"] = g[cols].astype(str).agg(" + ".join, axis=1)
+        rows.append(g)
+    if not rows:
+        return pd.DataFrame()
+    out = pd.concat(rows, ignore_index=True, sort=False)
+    out["CR"] = out["registrations"] / out["visits"].clip(lower=1)
+    out["baseline_CR"] = baseline_cr
+    out["CR_delta"] = out["CR"] - baseline_cr
+    out["share_of_traffic"] = out["visits"] / total_visits
+    interest = (out["avg_visitDuration"] / max(avg_duration, 1)).clip(upper=2) * 0.5 + (out["avg_pageViews"] / max(avg_pageviews, 1)).clip(upper=2) * 0.5
+    volume_factor = (out["visits"] / max(min_visits, 1)).clip(upper=1)
+    cr_drop = ((baseline_cr - out["CR"]) / max(baseline_cr, 0.0001)).clip(lower=0, upper=3)
+    out["priority_score"] = (100 * cr_drop * (0.65 + 0.35 * interest) * volume_factor).round(1)
+    out = out[(out["visits"] >= min_visits) & (out["CR"] < baseline_cr)]
+    for col in ["CR", "baseline_CR", "CR_delta", "share_of_traffic"]:
+        out[col] = (out[col] * 100).round(2)
+    for col in ["avg_visitDuration", "avg_pageViews"]:
+        out[col] = out[col].round(1)
+    display_cols = ["segment_type", "segment_name", "visits", "registrations", "CR", "baseline_CR", "CR_delta", "avg_visitDuration", "avg_pageViews", "share_of_traffic", "priority_score"]
+    return out.sort_values(["priority_score", "visits"], ascending=False)[display_cols].reset_index(drop=True)
+
+
+def _segment_mask(df: pd.DataFrame, segment_type: str, segment_name: str) -> pd.Series:
+    prep = _prepare_segment_frame(df)
+    defs = dict(SEGMENT_DEFINITIONS)
+    cols = defs.get(segment_type, [])
+    if not cols:
+        return pd.Series(False, index=df.index)
+    labels = prep[cols].astype(str).agg(" + ".join, axis=1)
+    return labels.eq(str(segment_name))
+
+
+def select_records_to_watch(scored: pd.DataFrame, problem_segments: pd.DataFrame, per_segment: int = 5) -> pd.DataFrame:
+    df = scored.copy()
+    if df.empty or problem_segments.empty:
+        return pd.DataFrame()
+    rows = []
+    for _, seg in problem_segments.head(5).iterrows():
+        mask = _segment_mask(df, str(seg["segment_type"]), str(seg["segment_name"]))
+        pool = df[mask].copy()
+        if "registered" in pool:
+            pool = pool[~pool["registered"].astype(bool)]
+        if pool.empty:
+            continue
+        pool["visitDuration"] = _numeric(pool.get("visitDuration"), pool.index)
+        selected = []
+        high = pool.sort_values("visitDuration", ascending=False).head(2)
+        selected.append((high, "длинный визит в проблемном сегменте"))
+        rest = pool.drop(index=high.index, errors="ignore")
+        if not rest.empty:
+            median = rest["visitDuration"].median()
+            mid = rest.assign(_dist=(rest["visitDuration"] - median).abs()).sort_values("_dist").head(2).drop(columns=["_dist"])
+            selected.append((mid, "типичный по длительности визит в проблемном сегменте"))
+            rest = rest.drop(index=mid.index, errors="ignore")
+        short = rest[(rest["visitDuration"] <= 15) | (pd.to_numeric(rest.get("pageViews", 0), errors="coerce").fillna(0) <= 1)].sort_values("visitDuration").head(1)
+        if not short.empty:
+            selected.append((short, "короткий отказной визит в проблемном сегменте"))
+        picked = pd.concat([x[0].assign(_watch_type=x[1]) for x in selected if not x[0].empty]).head(per_segment)
+        for _, row in picked.iterrows():
+            reason = (
+                f"Представитель проблемного сегмента {seg['segment_name']}: CR сегмента {seg['CR']}% ниже среднего {seg['baseline_CR']}%, "
+                f"визит {_duration_ru(row.get('visitDuration'))}, {int(float(row.get('pageViews') or 0))} просмотра(ов), регистрации нет. {row.get('_watch_type')}."
+            )
+            item = {"segment_name": seg["segment_name"], "priority_score": seg["priority_score"], "reason_to_watch": reason}
+            for col in ["visitID", "dateTime", "deviceCategory", "UTMSource", "UTMCampaign", "startURL", "endURL", "visitDuration", "pageViews", "goalsID"]:
+                item[col] = row.get(col, "")
+            rows.append(item)
+    return pd.DataFrame(rows)
+
+
+def webvisor_filter_table(records: pd.DataFrame) -> pd.DataFrame:
+    if records.empty:
+        return pd.DataFrame()
+    tmp = records.copy()
+    tmp["date"] = pd.to_datetime(tmp.get("dateTime"), errors="coerce").dt.date.astype(str)
+    return tmp.groupby("segment_name", dropna=False).agg(
+        date=("date", lambda s: ", ".join(sorted(set(x for x in s if x != "NaT")))[:200]),
+        device=("deviceCategory", lambda s: ", ".join(sorted(set(map(str, s))))),
+        UTMSource=("UTMSource", lambda s: ", ".join(sorted(set(map(str, s))))),
+        UTMCampaign=("UTMCampaign", lambda s: ", ".join(sorted(set(map(str, s))))),
+        startURL=("startURL", lambda s: ", ".join(sorted(set(map(str, s))))[:300]),
+        endURL=("endURL", lambda s: ", ".join(sorted(set(map(str, s))))[:300]),
+        visitID=("visitID", lambda s: ", ".join(map(str, s))),
+    ).reset_index()
+
+
+def analyze_hits(hits: pd.DataFrame, scored: pd.DataFrame | None = None) -> dict[str, pd.DataFrame | str]:
     hits = hits.copy()
     hits.columns = [c.replace("ym:pv:", "") for c in hits.columns]
     if hits.empty or "visitID" not in hits:
-        return {"warning": "Сейчас анализ построен только на визитах. Для анализа кликов, форм и поведения внутри страницы нужно включить загрузку hits или добавить события."}
+        return {"warning": "Анализ построен только на visits. Он умеет искать проблемные сегменты, но не видит клики, скролл и путь внутри визита. Для анализа пути включите hits или добавьте события."}
     hits["path"] = _text_series(hits, "URL").map(_path)
     per_visit = hits.groupby("visitID").agg(urls_in_chain=("path", "nunique"), hits=("path", "count")).reset_index()
     url_freq = hits["path"].value_counts().rename_axis("URL").reset_index(name="hits").head(20)
@@ -228,4 +382,26 @@ def analyze_hits(hits: pd.DataFrame) -> dict[str, pd.DataFrame | str]:
     if goal_cols:
         event_text = hits[goal_cols].astype(str).agg(" ".join, axis=1)
         event_freq = event_text[event_text.str.strip().ne("")].value_counts().rename_axis("event_or_goal").reset_index(name="hits").head(20)
-    return {"per_visit": per_visit, "url_freq": url_freq, "exits": exits, "event_freq": event_freq}
+    result = {"per_visit": per_visit, "url_freq": url_freq, "exits": exits, "event_freq": event_freq}
+    chains = hits.sort_values(["visitID", "dateTime" if "dateTime" in hits else "path"]).groupby("visitID")["path"].apply(lambda s: " → ".join(s.astype(str).head(6))).reset_index(name="url_chain")
+    if scored is not None and not scored.empty and "visitID" in scored:
+        meta = scored[["visitID", "registered", "endURL"]].copy()
+        meta["visitID"] = meta["visitID"].astype(str)
+        chains["visitID"] = chains["visitID"].astype(str)
+        chains_meta = chains.merge(meta, on="visitID", how="left")
+        nonconv = chains_meta[~chains_meta.get("registered", pd.Series(False, index=chains_meta.index)).astype(bool)]
+        conv = chains_meta[chains_meta.get("registered", pd.Series(False, index=chains_meta.index)).astype(bool)]
+        result["nonconverter_chains"] = nonconv["url_chain"].value_counts().rename_axis("url_chain").reset_index(name="visits").head(20)
+        result["converter_chains"] = conv["url_chain"].value_counts().rename_axis("url_chain").reset_index(name="visits").head(20)
+        result["nonconverter_end_urls"] = nonconv["endURL"].map(_path).value_counts().rename_axis("endURL").reset_index(name="visits").head(20)
+        if "startURL" in scored:
+            selected_paths = scored["startURL"].map(_path).dropna().astype(str).unique().tolist()[:10]
+            next_rows = []
+            for selected in selected_paths:
+                for chain in nonconv["url_chain"].dropna():
+                    parts = chain.split(" → ")
+                    for i, part in enumerate(parts[:-1]):
+                        if part == selected:
+                            next_rows.append({"selected_URL": selected, "next_URL": parts[i + 1]})
+            result["after_selected_url"] = pd.DataFrame(next_rows).value_counts().reset_index(name="visits").head(20) if next_rows else pd.DataFrame()
+    return result
