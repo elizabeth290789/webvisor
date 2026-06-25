@@ -54,12 +54,17 @@ def main() -> None:
 
     with st.sidebar:
         st.header("Параметры")
-        counter_id = st.number_input("counter_id", min_value=1, step=1)
+        counter_id = st.number_input("counter_id", min_value=1, value=18477952, step=1)
         today = dt.date.today()
-        date_from = st.date_input("date_from", today - dt.timedelta(days=7))
-        date_to = st.date_input("date_to", today - dt.timedelta(days=1))
+        yesterday = today - dt.timedelta(days=1)
+        date_from = st.date_input("date_from", yesterday, max_value=yesterday)
+        date_to = st.date_input("date_to", yesterday, max_value=yesterday)
+        st.caption("Для больших счетчиков лучше выбирать один завершенный день. Текущий день может быть недоступен или неполным в Logs API.")
+        if date_to > date_from and (date_to - date_from).days + 1 > 1:
+            st.warning("Вы выбрали период больше 1 дня. Для большого счетчика выгрузка может занять много времени. Рекомендуем начать с одного дня и URL-фильтра.")
         url_contains_load = st.text_input(
             "URL содержит *",
+            value="chat",
             help="Обязательный фильтр: применяется в Logs API до скачивания данных.",
         )
         load_hits = st.checkbox(
@@ -67,8 +72,11 @@ def main() -> None:
             value=False,
             help="Выключено по умолчанию для быстрой выгрузки больших счетчиков.",
         )
-        st.warning("Для больших счетчиков выбирайте 1 день и URL-фильтр, иначе выгрузка может занять много времени")
-        reg_goals = st.text_input("ID целей регистрации через запятую", help="Если оставить пустым, любая сессия считается без регистрации для правил регистрации.")
+        reg_goals = st.text_input(
+            "ID целей регистрации через запятую",
+            value="2898778",
+            help="Если оставить пустым, любая сессия считается без регистрации для правил регистрации.",
+        )
         if demo_mode:
             st.info("Сейчас приложение работает на демо-данных. Поля ниже нужны для реальной Метрики после добавления токена.")
             load_label = "Обновить демо-данные"
@@ -80,7 +88,11 @@ def main() -> None:
         st.session_state["scored"] = load_demo_score([x.strip() for x in reg_goals.split(",") if x.strip()] or ["1001"])
         st.session_state["hits"] = build_demo_visits_and_hits()[1]
     elif load:
-        if not url_contains_load.strip():
+        if date_to < date_from:
+            st.error("date_to должен быть не раньше date_from.")
+        elif date_to > yesterday:
+            st.error("date_to не должен быть позже вчерашнего дня, потому что Logs API может не отдавать текущий день или отдавать неполные данные.")
+        elif not url_contains_load.strip():
             st.error("Заполните обязательное поле «URL содержит», чтобы не выгружать весь счетчик.")
         else:
             try:
