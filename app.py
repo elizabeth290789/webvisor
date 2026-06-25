@@ -20,6 +20,19 @@ except Exception as exc:
     st.stop()
 
 
+URL_SEARCH_OPTIONS = {
+    "startURL — страница входа": "start",
+    "endURL — страница выхода": "end",
+    "startURL или endURL": "start_or_end",
+    "любой URL внутри визита, только если включены hits": "any_hit",
+}
+DEFAULT_URL_SEARCH_LABEL = "startURL или endURL"
+URL_WITHOUT_HITS_HELP = (
+    "Без загрузки hits приложение видит только startURL и endURL визита. "
+    "Чтобы искать посещение страницы внутри визита, включите загрузку hits."
+)
+
+
 @st.cache_data(show_spinner=False, ttl=3600)
 def load_data(
     counter_id: int,
@@ -27,8 +40,16 @@ def load_data(
     date_to: str,
     url_contains: str,
     load_hits: bool,
+    url_search_scope: str,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    return MetrikaLogsClient().fetch_visits_and_hits(counter_id, date_from, date_to, url_contains, load_hits)
+    return MetrikaLogsClient().fetch_visits_and_hits(
+        counter_id,
+        date_from,
+        date_to,
+        url_contains,
+        load_hits,
+        url_search_scope,
+    )
 
 
 def load_demo_score(registration_goal_ids: list[str] | None = None) -> pd.DataFrame:
@@ -38,6 +59,24 @@ def load_demo_score(registration_goal_ids: list[str] | None = None) -> pd.DataFr
 
 def csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8-sig")
+
+
+def filter_by_url(scored: pd.DataFrame, hits: pd.DataFrame, url_contains: str, url_search_scope: str) -> pd.DataFrame:
+    start_match = scored.get("startURL", pd.Series(dtype=str)).astype(str).str.contains(url_contains, case=False, na=False)
+    end_match = scored.get("endURL", pd.Series(dtype=str)).astype(str).str.contains(url_contains, case=False, na=False)
+
+    if url_search_scope == "start":
+        return scored[start_match]
+    if url_search_scope == "end":
+        return scored[end_match]
+    if url_search_scope == "any_hit" and not hits.empty and "ym:pv:visitID" in hits and "ym:pv:URL" in hits:
+        hit_visit_ids = hits.loc[
+            hits["ym:pv:URL"].astype(str).str.contains(url_contains, case=False, na=False),
+            "ym:pv:visitID",
+        ].astype(str)
+        return scored[scored.get("visitID", pd.Series(dtype=str)).astype(str).isin(hit_visit_ids)]
+
+    return scored[start_match | end_match]
 
 
 def main() -> None:
@@ -62,16 +101,26 @@ def main() -> None:
         st.caption("Для больших счетчиков лучше выбирать один завершенный день. Текущий день может быть недоступен или неполным в Logs API.")
         if date_to > date_from and (date_to - date_from).days + 1 > 1:
             st.warning("Вы выбрали период больше 1 дня. Для большого счетчика выгрузка может занять много времени. Рекомендуем начать с одного дня и URL-фильтра.")
-        url_contains_load = st.text_input(
-            "URL содержит *",
-            value="chat",
-            help="Обязательный фильтр: применяется в Logs API до скачивания данных.",
-        )
         load_hits = st.checkbox(
             "Загружать hits",
             value=False,
             help="Выключено по умолчанию для быстрой выгрузки больших счетчиков.",
         )
+        url_search_label = st.selectbox(
+            "Где искать URL",
+            list(URL_SEARCH_OPTIONS),
+            index=list(URL_SEARCH_OPTIONS).index(DEFAULT_URL_SEARCH_LABEL),
+        )
+        url_search_scope = URL_SEARCH_OPTIONS[url_search_label]
+        url_field_label = "URL содержит *" if load_hits else "URL входа или выхода содержит *"
+        url_contains_load = st.text_input(
+            url_field_label,
+            value="chat",
+            help="Обязательный фильтр: применяется в Logs API до скачивания данных.",
+        )
+        st.caption(URL_WITHOUT_HITS_HELP)
+        if url_search_scope == "any_hit" and not load_hits:
+            st.warning("Поиск по любому URL внутри визита доступен только при включенной загрузке hits.")
         reg_goals = st.text_input(
             "ID целей регистрации через запятую",
             value="2898778",
@@ -87,13 +136,14 @@ def main() -> None:
     if load and demo_mode:
         st.session_state["scored"] = load_demo_score([x.strip() for x in reg_goals.split(",") if x.strip()] or ["1001"])
         st.session_state["hits"] = build_demo_visits_and_hits()[1]
+        st.session_state["url_search_scope"] = url_search_scope
     elif load:
         if date_to < date_from:
             st.error("date_to должен быть не раньше date_from.")
         elif date_to > yesterday:
             st.error("date_to не должен быть позже вчерашнего дня, потому что Logs API может не отдавать текущий день или отдавать неполные данные.")
         elif not url_contains_load.strip():
-            st.error("Заполните обязательное поле «URL содержит», чтобы не выгружать весь счетчик.")
+            st.error("Заполните обязательное поле URL, чтобы не выгружать весь счетчик.")
         else:
             try:
                 with st.spinner("Создаем requests в Logs API и скачиваем parts..."):
@@ -104,6 +154,7 @@ def main() -> None:
                         str(date_to),
                         url_contains_load.strip(),
                         load_hits,
+                        url_search_scope,
                     )
                     st.session_state["scored"] = score_sessions(
                         visits_df,
@@ -111,6 +162,7 @@ def main() -> None:
                         [x.strip() for x in reg_goals.split(",") if x.strip()],
                     )
                     st.session_state["hits"] = hits_df
+                    st.session_state["url_search_scope"] = url_search_scope
             except MetrikaAPIError as exc:
                 st.error(str(exc))
             except Exception as exc:
@@ -126,7 +178,24 @@ def main() -> None:
         device_filter = st.selectbox("Устройство", ["Все", "mobile", "desktop", "tablet"])
         no_reg_only = st.checkbox("Только без регистрации", value=True)
     with col2:
-        url_contains = st.text_input("URL содержит", value=st.session_state.get("url_contains_load", ""))
+        filter_hits_loaded = not st.session_state.get("hits", pd.DataFrame()).empty
+        current_scope = st.session_state.get("url_search_scope", URL_SEARCH_OPTIONS[DEFAULT_URL_SEARCH_LABEL])
+        current_label = next(
+            (label for label, scope in URL_SEARCH_OPTIONS.items() if scope == current_scope),
+            DEFAULT_URL_SEARCH_LABEL,
+        )
+        filter_url_search_label = st.selectbox(
+            "Где искать URL",
+            list(URL_SEARCH_OPTIONS),
+            index=list(URL_SEARCH_OPTIONS).index(current_label),
+            key="filter_url_search_label",
+        )
+        filter_url_search_scope = URL_SEARCH_OPTIONS[filter_url_search_label]
+        filter_url_label = "URL содержит" if filter_hits_loaded else "URL входа или выхода содержит"
+        url_contains = st.text_input(filter_url_label, value=st.session_state.get("url_contains_load", ""))
+        st.caption(URL_WITHOUT_HITS_HELP)
+        if filter_url_search_scope == "any_hit" and not filter_hits_loaded:
+            st.warning("Поиск по любому URL внутри визита доступен только при включенной загрузке hits.")
         utm_contains = st.text_input("UTM campaign содержит")
     with col3:
         min_score = st.slider("score больше N", 0, 100, 40)
@@ -138,7 +207,12 @@ def main() -> None:
     if no_reg_only and "registered" in filtered:
         filtered = filtered[~filtered["registered"]]
     if url_contains:
-        filtered = filtered[filtered.get("startURL", pd.Series(dtype=str)).astype(str).str.contains(url_contains, case=False, na=False) | filtered.get("endURL", pd.Series(dtype=str)).astype(str).str.contains(url_contains, case=False, na=False)]
+        filtered = filter_by_url(
+            filtered,
+            st.session_state.get("hits", pd.DataFrame()),
+            url_contains,
+            filter_url_search_scope,
+        )
     if utm_contains and "UTMCampaign" in filtered:
         filtered = filtered[filtered["UTMCampaign"].astype(str).str.contains(utm_contains, case=False, na=False)]
     filtered = filtered[(filtered["score"] >= min_score) & (pd.to_numeric(filtered.get("visitDuration", 0), errors="coerce").fillna(0) >= min_duration)]
