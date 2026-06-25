@@ -21,8 +21,14 @@ except Exception as exc:
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def load_data(counter_id: int, date_from: str, date_to: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    return MetrikaLogsClient().fetch_visits_and_hits(counter_id, date_from, date_to)
+def load_data(
+    counter_id: int,
+    date_from: str,
+    date_to: str,
+    url_contains: str,
+    load_hits: bool,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    return MetrikaLogsClient().fetch_visits_and_hits(counter_id, date_from, date_to, url_contains, load_hits)
 
 
 def load_demo_score(registration_goal_ids: list[str] | None = None) -> pd.DataFrame:
@@ -51,6 +57,16 @@ def main() -> None:
         today = dt.date.today()
         date_from = st.date_input("date_from", today - dt.timedelta(days=7))
         date_to = st.date_input("date_to", today - dt.timedelta(days=1))
+        url_contains_load = st.text_input(
+            "URL содержит *",
+            help="Обязательный фильтр: применяется в Logs API до скачивания данных.",
+        )
+        load_hits = st.checkbox(
+            "Загружать hits",
+            value=False,
+            help="Выключено по умолчанию для быстрой выгрузки больших счетчиков.",
+        )
+        st.warning("Для больших счетчиков выбирайте 1 день и URL-фильтр, иначе выгрузка может занять много времени")
         reg_goals = st.text_input("ID целей регистрации через запятую", help="Если оставить пустым, любая сессия считается без регистрации для правил регистрации.")
         if demo_mode:
             st.info("Сейчас приложение работает на демо-данных. Поля ниже нужны для реальной Метрики после добавления токена.")
@@ -62,15 +78,28 @@ def main() -> None:
     if load and demo_mode:
         st.session_state["scored"] = load_demo_score([x.strip() for x in reg_goals.split(",") if x.strip()] or ["1001"])
     elif load:
-        try:
-            with st.spinner("Создаем requests в Logs API и скачиваем parts..."):
-                visits_df, hits_df = load_data(int(counter_id), str(date_from), str(date_to))
-                st.session_state["scored"] = score_sessions(visits_df, hits_df, [x.strip() for x in reg_goals.split(",") if x.strip()])
-        except MetrikaAPIError as exc:
-            st.error(str(exc))
-        except Exception as exc:
-            st.exception(exc)
-
+        if not url_contains_load.strip():
+            st.error("Заполните обязательное поле «URL содержит», чтобы не выгружать весь счетчик.")
+        else:
+            try:
+                with st.spinner("Создаем requests в Logs API и скачиваем parts..."):
+                    st.session_state["url_contains_load"] = url_contains_load.strip()
+                    visits_df, hits_df = load_data(
+                        int(counter_id),
+                        str(date_from),
+                        str(date_to),
+                        url_contains_load.strip(),
+                        load_hits,
+                    )
+                    st.session_state["scored"] = score_sessions(
+                        visits_df,
+                        hits_df,
+                        [x.strip() for x in reg_goals.split(",") if x.strip()],
+                    )
+            except MetrikaAPIError as exc:
+                st.error(str(exc))
+            except Exception as exc:
+                st.exception(exc)
     scored = st.session_state.get("scored")
     if scored is None:
         st.info("Введите параметры и нажмите «Загрузить и посчитать». Если YANDEX_METRIKA_TOKEN не задан, приложение покажет демо-данные.")
@@ -82,7 +111,7 @@ def main() -> None:
         device_filter = st.selectbox("Устройство", ["Все", "mobile", "desktop", "tablet"])
         no_reg_only = st.checkbox("Только без регистрации", value=True)
     with col2:
-        url_contains = st.text_input("URL содержит")
+        url_contains = st.text_input("URL содержит", value=st.session_state.get("url_contains_load", ""))
         utm_contains = st.text_input("UTM campaign содержит")
     with col3:
         min_score = st.slider("score больше N", 0, 100, 40)

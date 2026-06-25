@@ -30,9 +30,39 @@ def score_sessions(visits: pd.DataFrame, hits: pd.DataFrame, registration_goal_i
     if "visitID" not in visits:
         return visits.assign(score=0, reasons="Нет visitID в выгрузке")
 
+    hit_feature_cols = [
+        "key_page",
+        "important_url",
+        "cta_click",
+        "form_start",
+        "form_error",
+        "modal_close",
+        "scroll_deep",
+    ]
     hit_features = _hit_features(hits)
     visits = visits.merge(hit_features, how="left", on="visitID")
-    for col in ["key_page", "important_url", "cta_click", "form_start", "form_error", "modal_close", "scroll_deep"]:
+    visit_url_text = (
+        visits.get("startURL", pd.Series("", index=visits.index)).astype(str)
+        + " "
+        + visits.get("endURL", pd.Series("", index=visits.index)).astype(str)
+    )
+    key_page_from_hits = (
+        visits["key_page"].fillna(False)
+        if "key_page" in visits
+        else pd.Series(False, index=visits.index)
+    )
+    important_url_from_hits = (
+        visits["important_url"].fillna(False)
+        if "important_url" in visits
+        else pd.Series(False, index=visits.index)
+    )
+    visits["key_page"] = key_page_from_hits | visit_url_text.map(lambda x: _contains_any(x, KEY_URL_PARTS))
+    visits["important_url"] = important_url_from_hits | visit_url_text.map(
+        lambda x: _contains_any(x, ["/signup", "/register", "/checkout", "/demo"])
+    )
+    for col in hit_feature_cols:
+        if col not in visits:
+            visits[col] = False
         visits[col] = visits[col].fillna(False).astype(bool)
 
     scores: list[int] = []
