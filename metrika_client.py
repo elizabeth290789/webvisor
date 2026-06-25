@@ -64,13 +64,32 @@ class MetrikaLogsClient:
         self.session = requests.Session()
         self.session.headers.update({"Authorization": f"OAuth {self.token}", "Accept-Encoding": "gzip"})
 
-    def fetch_visits_and_hits(self, counter_id: int, date_from: str, date_to: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-        visits = self.fetch_log(counter_id, "visits", date_from, date_to, VISIT_FIELDS).dataframe
-        hits = self.fetch_log(counter_id, "hits", date_from, date_to, HIT_FIELDS).dataframe
+    def fetch_visits_and_hits(
+        self,
+        counter_id: int,
+        date_from: str,
+        date_to: str,
+        url_contains: str,
+        load_hits: bool = False,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        visits_filter = self._url_filter("visits", url_contains)
+        visits = self.fetch_log(counter_id, "visits", date_from, date_to, VISIT_FIELDS, visits_filter).dataframe
+        if not load_hits:
+            return visits, pd.DataFrame()
+        hits_filter = self._url_filter("hits", url_contains)
+        hits = self.fetch_log(counter_id, "hits", date_from, date_to, HIT_FIELDS, hits_filter).dataframe
         return visits, hits
 
-    def fetch_log(self, counter_id: int, source: str, date_from: str, date_to: str, fields: Iterable[str]) -> LogRequestResult:
-        request_id = self._create_request(counter_id, source, date_from, date_to, fields)
+    def fetch_log(
+        self,
+        counter_id: int,
+        source: str,
+        date_from: str,
+        date_to: str,
+        fields: Iterable[str],
+        filters: str | None = None,
+    ) -> LogRequestResult:
+        request_id = self._create_request(counter_id, source, date_from, date_to, fields, filters)
         try:
             info = self._wait_processed(counter_id, request_id)
             frames = [self._download_part(counter_id, request_id, p["part_number"]) for p in info.get("parts", [])]
@@ -104,12 +123,28 @@ class MetrikaLogsClient:
     def _sanitize(self, value: str) -> str:
         return value.replace(self.token, "<hidden_token>") if self.token else value
 
-    def _create_request(self, counter_id: int, source: str, date_from: str, date_to: str, fields: Iterable[str]) -> int:
+    def _create_request(
+        self,
+        counter_id: int,
+        source: str,
+        date_from: str,
+        date_to: str,
+        fields: Iterable[str],
+        filters: str | None = None,
+    ) -> int:
         params = {"source": source, "date1": date_from, "date2": date_to, "fields": ",".join(fields)}
+        if filters:
+            params["filters"] = filters
         data = self._request("POST", self._logrequests_url(counter_id), params=params).json()
         return int(data["log_request"]["request_id"])
 
-    def _wait_processed(self, counter_id: int, request_id: int, poll_seconds: int = 10, max_wait_seconds: int = 900) -> dict:
+    def _url_filter(self, source: str, url_contains: str) -> str:
+        escaped = url_contains.replace("\\", "\\\\").replace("'", "\\'")
+        if source == "hits":
+            return f"ym:pv:URL=@'{escaped}'"
+        return f"(ym:s:startURL=@'{escaped}' OR ym:s:endURL=@'{escaped}')"
+
+    def _wait_processed(self, counter_id: int, request_id: int, poll_seconds: int = 10, max_wait_seconds: int = 300) -> dict:
         deadline = time.time() + max_wait_seconds
         while time.time() < deadline:
             data = self._request("GET", self._logrequest_url(counter_id, request_id)).json()["log_request"]
@@ -119,7 +154,10 @@ class MetrikaLogsClient:
             if status in {"canceled", "failed"}:
                 raise MetrikaAPIError(f"Log request {request_id} завершился со статусом {status}")
             time.sleep(poll_seconds)
-        raise MetrikaAPIError(f"Log request {request_id} не подготовлен за {max_wait_seconds} секунд")
+        raise MetrikaAPIError(
+            f"Logs API готовит данные дольше {max_wait_seconds // 60} минут. "
+            "Для больших счетчиков выберите период 1 день и более точный URL-фильтр."
+        )
 
     def _download_part(self, counter_id: int, request_id: int, part_number: int) -> pd.DataFrame:
         response = self._request("GET", self._logrequest_url(counter_id, request_id, f"/part/{part_number}/download"))
