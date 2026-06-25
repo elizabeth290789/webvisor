@@ -71,12 +71,13 @@ class MetrikaLogsClient:
         date_to: str,
         url_contains: str,
         load_hits: bool = False,
+        url_search_scope: str = "start_or_end",
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
-        visits_filter = self._url_filter("visits", url_contains)
+        visits_filter = self._url_filter("visits", url_contains, url_search_scope)
         visits = self.fetch_log(counter_id, "visits", date_from, date_to, VISIT_FIELDS, visits_filter).dataframe
         if not load_hits:
             return visits, pd.DataFrame()
-        hits_filter = self._url_filter("hits", url_contains)
+        hits_filter = self._url_filter("hits", url_contains, url_search_scope)
         hits = self.fetch_log(counter_id, "hits", date_from, date_to, HIT_FIELDS, hits_filter).dataframe
         return visits, hits
 
@@ -138,10 +139,14 @@ class MetrikaLogsClient:
         data = self._request("POST", self._logrequests_url(counter_id), params=params).json()
         return int(data["log_request"]["request_id"])
 
-    def _url_filter(self, source: str, url_contains: str) -> str:
+    def _url_filter(self, source: str, url_contains: str, url_search_scope: str = "start_or_end") -> str:
         escaped = url_contains.replace("\\", "\\\\").replace("'", "\\'")
         if source == "hits":
             return f"ym:pv:URL=@'{escaped}'"
+        if url_search_scope == "start":
+            return f"ym:s:startURL=@'{escaped}'"
+        if url_search_scope == "end":
+            return f"ym:s:endURL=@'{escaped}'"
         return f"(ym:s:startURL=@'{escaped}' OR ym:s:endURL=@'{escaped}')"
 
     def _wait_processed(self, counter_id: int, request_id: int, poll_seconds: int = 10, max_wait_seconds: int = 300) -> dict:
