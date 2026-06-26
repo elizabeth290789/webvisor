@@ -92,6 +92,56 @@ class MetrikaLogsClient:
         hits = self.fetch_log(counter_id, "hits", date_from, date_to, HIT_FIELDS, hits_filter).dataframe
         return visits, hits
 
+
+    def fetch_user_path_report(
+        self,
+        counter_id: int,
+        date_from: str,
+        date_to: str,
+        url_contains: str,
+        mode: str = "Пути от страницы входа",
+        url_search_scope: str = "start_or_end",
+        batch_size: int = 500,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Fetch visits plus full hit chains for visits selected for the path report."""
+        if mode == "Пути после выбранной страницы":
+            matching_hits = self.fetch_log(
+                counter_id, "hits", date_from, date_to, HIT_FIELDS, self._url_filter("hits", url_contains)
+            ).dataframe
+            visit_ids = self._extract_visit_ids(matching_hits, "ym:pv:visitID")
+            visits = self._fetch_visits_by_ids(counter_id, date_from, date_to, visit_ids, batch_size)
+        else:
+            scope = "start" if mode == "Пути от страницы входа" else url_search_scope
+            visits = self.fetch_visits(counter_id, date_from, date_to, url_contains, scope)
+            visit_ids = self._extract_visit_ids(visits, "ym:s:visitID")
+        hits = self._fetch_hits_by_visit_ids(counter_id, date_from, date_to, visit_ids, batch_size)
+        return visits, hits
+
+    def _extract_visit_ids(self, frame: pd.DataFrame, column: str) -> list[str]:
+        if frame.empty or column not in frame:
+            return []
+        return [str(value) for value in frame[column].dropna().astype(str).unique().tolist()]
+
+    def _ids_filter(self, field: str, ids: list[str]) -> str:
+        clean_ids = [str(value).split(".")[0] for value in ids if str(value).strip()]
+        return f"{field} IN ({','.join(clean_ids)})"
+
+    def _fetch_hits_by_visit_ids(self, counter_id: int, date_from: str, date_to: str, visit_ids: list[str], batch_size: int) -> pd.DataFrame:
+        frames = []
+        for index in range(0, len(visit_ids), batch_size):
+            batch = visit_ids[index:index + batch_size]
+            if batch:
+                frames.append(self.fetch_log(counter_id, "hits", date_from, date_to, HIT_FIELDS, self._ids_filter("ym:pv:visitID", batch)).dataframe)
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+    def _fetch_visits_by_ids(self, counter_id: int, date_from: str, date_to: str, visit_ids: list[str], batch_size: int) -> pd.DataFrame:
+        frames = []
+        for index in range(0, len(visit_ids), batch_size):
+            batch = visit_ids[index:index + batch_size]
+            if batch:
+                frames.append(self.fetch_log(counter_id, "visits", date_from, date_to, VISIT_FIELDS, self._ids_filter("ym:s:visitID", batch)).dataframe)
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
     def fetch_log(
         self,
         counter_id: int,
