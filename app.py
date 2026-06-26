@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import re
 
 import pandas as pd
 import streamlit as st
@@ -54,18 +55,23 @@ def _normalize_visit_columns(visits: pd.DataFrame) -> pd.DataFrame:
 
 
 def _goal_ids(value: object) -> set[str]:
-    text = "" if pd.isna(value) else str(value)
-    for separator in [",", ";", "|"]:
-        text = text.replace(separator, " ")
-    return {part.strip() for part in text.split() if part.strip()}
+    if value is None:
+        text = ""
+    else:
+        try:
+            text = "" if pd.isna(value) else str(value)
+        except (TypeError, ValueError):
+            text = str(value)
+    text = re.sub(r"\b(\d+)\.0+\b", r"\1", text)
+    return set(re.findall(r"\d+", text))
 
 
 def _mark_goal(visits: pd.DataFrame, goal_id: str) -> pd.DataFrame:
     visits = _normalize_visit_columns(visits)
-    clean_goal_id = goal_id.strip()
-    if not clean_goal_id or "goalsID" not in visits:
+    goal_ids = _goal_ids(goal_id)
+    if not goal_ids or "goalsID" not in visits:
         return visits
-    visits["goal_reached"] = visits["goalsID"].map(lambda value: clean_goal_id in _goal_ids(value))
+    visits["goal_reached"] = visits["goalsID"].map(lambda value: bool(_goal_ids(value).intersection(goal_ids)))
     return visits
 
 
@@ -95,7 +101,7 @@ def _render_sidebar() -> tuple[int, dt.date, dt.date, str, str, bool]:
             value=DEFAULT_URL_CONTAINS,
             help="Обязательный фильтр по startURL или endURL, чтобы не выгружать весь счетчик.",
         )
-        goal_id = st.text_input("ID цели", value="2898778", help="Один ID цели для пометки goal_reached в таблице.")
+        goal_id = st.text_input("ID цели", value="2898778", help="Один или несколько ID целей для пометки goal_reached в таблице.")
         load = st.button("Загрузить visits", type="primary")
     return int(counter_id), date_from, date_to, url_contains.strip(), goal_id.strip(), load
 
@@ -115,6 +121,58 @@ def _validate_inputs(date_from: dt.date, date_to: dt.date, url_contains: str, to
         st.error("Заполните URL-фильтр, чтобы не выгружать весь счетчик.")
         return False
     return True
+
+
+def _render_goal_diagnostics(visits: pd.DataFrame, goal_id: str) -> None:
+    st.subheader("Диагностика целей")
+
+    total_visits = len(visits)
+    entered_goal_ids = sorted(_goal_ids(goal_id), key=int)
+
+    if "goalsID" not in visits:
+        st.warning("В выгрузке нет колонки goalsID.")
+        st.write(f"Всего визитов в выгрузке: **{total_visits}**")
+        st.write(f"ID целей, введенные пользователем: **{', '.join(entered_goal_ids) or '—'}**")
+        return
+
+    goals = visits["goalsID"]
+    parsed_goals = goals.map(_goal_ids)
+    visits_with_goals = int(parsed_goals.map(bool).sum())
+    goal_counts = parsed_goals.explode().dropna().value_counts().rename_axis("goalID").reset_index(name="visits")
+    unique_goal_ids = sorted(goal_counts["goalID"].astype(str).tolist(), key=int) if not goal_counts.empty else []
+    found_goal_ids = sorted(set(entered_goal_ids).intersection(unique_goal_ids), key=int)
+
+    col1, col2 = st.columns(2)
+    col1.metric("Визитов всего в выгрузке", total_visits)
+    col2.metric("Визитов с непустым goalsID", visits_with_goals)
+    st.write(f"Уникальные goalsID в выборке: **{', '.join(unique_goal_ids) or '—'}**")
+    st.write(f"ID целей, введенные пользователем: **{', '.join(entered_goal_ids) or '—'}**")
+    st.write(f"Введенные ID, найденные в выборке: **{', '.join(found_goal_ids) or '—'}**")
+
+    if not found_goal_ids and entered_goal_ids:
+        st.warning(
+            "В выбранной выгрузке не найдено ни одного из указанных ID целей. "
+            "Проверьте ID целей, счетчик, URL-фильтр и дату."
+        )
+
+    st.write("Сколько раз встречается каждый goalID")
+    if goal_counts.empty:
+        st.info("В выборке нет визитов с goalsID.")
+    else:
+        st.dataframe(goal_counts, use_container_width=True, hide_index=True)
+
+    st.subheader("Примеры визитов с goalsID")
+    examples = visits.loc[parsed_goals.map(bool)].copy()
+    if examples.empty:
+        st.info("Нет примеров визитов с непустым goalsID.")
+        return
+
+    examples["parsed_goals"] = parsed_goals.loc[examples.index].map(lambda ids: ", ".join(sorted(ids, key=int)))
+    if "registered" not in examples:
+        examples["registered"] = parsed_goals.loc[examples.index].map(lambda ids: bool(set(entered_goal_ids).intersection(ids)))
+    example_cols = ["visitID", "dateTime", "startURL", "endURL", "goalsID", "parsed_goals", "registered"]
+    existing_cols = [column for column in example_cols if column in examples]
+    st.dataframe(examples[existing_cols].head(50), use_container_width=True, hide_index=True)
 
 
 def _render_visits_table(visits: pd.DataFrame) -> None:
@@ -152,6 +210,7 @@ def main() -> None:
         st.info("Введите counter_id, date_from, date_to, URL-фильтр и ID цели, затем нажмите «Загрузить visits».")
         return
 
+    _render_goal_diagnostics(visits, goal_id)
     _render_visits_table(visits)
 
     if EXPERIMENTAL_MODE:

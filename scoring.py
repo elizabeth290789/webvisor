@@ -1,6 +1,7 @@
 """Scoring and aggregation helpers for CRO-focused Webvisor triage."""
 from __future__ import annotations
 
+import re
 from urllib.parse import urlparse
 
 import pandas as pd
@@ -20,9 +21,15 @@ def _contains_any(value: object, markers: list[str]) -> bool:
 
 
 def _goals_set(value: object) -> set[str]:
-    if pd.isna(value) or value == "":
-        return set()
-    return {part.strip() for part in str(value).replace(";", ",").split(",") if part.strip()}
+    if value is None:
+        text = ""
+    else:
+        try:
+            text = "" if pd.isna(value) else str(value)
+        except (TypeError, ValueError):
+            text = str(value)
+    text = re.sub(r"\b(\d+)\.0+\b", r"\1", text)
+    return set(re.findall(r"\d+", text))
 
 
 def _numeric(series: pd.Series | object, index: pd.Index) -> pd.Series:
@@ -55,7 +62,7 @@ def _same_url_family(start_url: object, end_url: object) -> bool:
 
 
 def score_sessions(visits: pd.DataFrame, hits: pd.DataFrame, registration_goal_ids: list[str] | None = None) -> pd.DataFrame:
-    goal_ids = set(registration_goal_ids or REGISTRATION_GOAL_IDS)
+    goal_ids = set().union(*(_goals_set(goal_id) for goal_id in (registration_goal_ids or REGISTRATION_GOAL_IDS)))
     visits = visits.copy()
     hits = hits.copy()
     visits.columns = [c.replace("ym:s:", "") for c in visits.columns]
