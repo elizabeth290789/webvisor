@@ -74,6 +74,16 @@ OPENAI_API_KEY = "ваш_openai_api_key"
 - Формирует AI-summary через OpenAI, если есть `OPENAI_API_KEY`; иначе использует rule-based summary.
 - Экспортирует CSV: top проблемных визитов, все визиты со score, агрегаты по URL/device/UTM.
 
+
+## Как понять, почему упал Streamlit Cloud
+
+1. Откройте приложение в Streamlit Community Cloud и нажмите **Manage app**.
+2. Перейдите в раздел **Logs**.
+3. В логах ищите строки с маркерами `Failed`, `Traceback`, `ModuleNotFoundError`, `ImportError` или `SyntaxError`.
+4. Скопируйте и пришлите последние 50 строк логов — обычно в них есть точная причина падения и файл, где оно произошло.
+
+Перед деплоем также проверьте, что GitHub Actions workflow **Smoke test** прошел успешно: он компилирует основные Python-файлы и выполняет `python -c "import app"`, чтобы поймать ошибки импорта до Streamlit Cloud.
+
 ## Локальный запуск, если когда-нибудь понадобится
 
 Локальный запуск не обязателен: проще использовать Streamlit Community Cloud. Но для локальной проверки можно выполнить:

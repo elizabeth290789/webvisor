@@ -5,10 +5,6 @@ import datetime as dt
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="Webvisor Session Triage", layout="wide")
-st.title("Отбор записей Вебвизора для ручного просмотра")
-st.caption("Честный помощник: сначала проверяет, хватает ли данных для выводов, затем подбирает записи для просмотра в Вебвизоре.")
-
 try:
     from demo_data import build_demo_visits_and_hits
     from metrika_client import MetrikaAPIError, MetrikaLogsClient, get_metrika_token
@@ -145,6 +141,10 @@ def _render_sample_status(filtered: pd.DataFrame, url_contains: str) -> tuple[di
 
 
 def main() -> None:
+    st.set_page_config(page_title="Webvisor Session Triage", layout="wide")
+    st.title("Отбор записей Вебвизора для ручного просмотра")
+    st.caption("Честный помощник: сначала проверяет, хватает ли данных для выводов, затем подбирает записи для просмотра в Вебвизоре.")
+
     demo_mode = not bool(get_metrika_token())
     if demo_mode:
         st.warning("Демо-режим: YANDEX_METRIKA_TOKEN не задан, поэтому показаны тестовые данные. Добавьте секрет в Streamlit Community Cloud, чтобы подключить реальные данные.")
@@ -197,6 +197,7 @@ def main() -> None:
                     st.session_state["url_search_scope"] = url_search_scope
             except MetrikaAPIError as exc:
                 st.error(str(exc))
+                st.exception(exc)
             except Exception as exc:
                 st.exception(exc)
 
@@ -289,8 +290,9 @@ def main() -> None:
             st.download_button("CSV: агрегаты", csv_bytes(combined), "aggregated_stats.csv", "text/csv")
 
 
-try:
-    main()
-except Exception as exc:
-    st.error("Критическая ошибка при запуске приложения.")
-    st.exception(exc)
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        st.error("Критическая ошибка при запуске приложения.")
+        st.exception(exc)
