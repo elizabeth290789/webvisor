@@ -4,3 +4,5 @@ requests==2.34.2
 openai==2.44.0
 python-dateutil==2.9.0.post0
 pillow==12.2.0
+
+plotly==6.5.0
