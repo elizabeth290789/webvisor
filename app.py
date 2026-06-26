@@ -201,8 +201,8 @@ def _build_visit_paths(visits: pd.DataFrame, hits: pd.DataFrame, selected_ids: l
         return paths
     keep_cols = [c for c in ["visitID", "dateTime", "startURL", "endURL", "pageViews", "visitDuration", "bounce", "goalsID", "selected_goal_reached", "lastTrafficSource", "UTMSource", "UTMCampaign", "deviceCategory"] if c in visits]
     paths = paths.merge(visits[keep_cols], on="visitID", how="left")
-    paths["target_reached"] = paths.get("selected_goal_reached", False).fillna(False).astype(bool)
-    if mode == "Пути от страницы входа":
+    paths["target_reached"] = paths["selected_goal_reached"].fillna(False).astype(bool) if "selected_goal_reached" in paths else False
+    if mode == "Пути от страницы входа" and "startURL" in paths:
         paths = paths[paths["startURL"].map(lambda v: url_filter in str(v) or _normalize_url(url_filter) in _normalize_url(v))]
     elif mode == "Пути до цели":
         paths = paths[paths["target_reached"]]
@@ -216,8 +216,9 @@ def _build_visit_paths(visits: pd.DataFrame, hits: pd.DataFrame, selected_ids: l
 
 
 def _aggregate_paths(paths: pd.DataFrame) -> pd.DataFrame:
-    if paths.empty:
-        return pd.DataFrame()
+    required = {"path", "visitID", "target_reached", "exit_after_first"}
+    if paths.empty or not required.issubset(paths.columns):
+        return pd.DataFrame(columns=["path", "visits", "target_visits", "exits", "avg_pageViews", "avg_visitDuration", "share", "CR", "exit_rate"])
     df = paths.copy()
     df["pageViews"] = pd.to_numeric(df.get("pageViews"), errors="coerce")
     df["visitDuration"] = pd.to_numeric(df.get("visitDuration"), errors="coerce")
@@ -230,10 +231,14 @@ def _aggregate_paths(paths: pd.DataFrame) -> pd.DataFrame:
 
 def _transitions(paths: pd.DataFrame) -> pd.DataFrame:
     rows=[]
+    if paths.empty or not {"path_steps", "visitID", "target_reached"}.issubset(paths.columns):
+        return pd.DataFrame(columns=["step","from_url","to_url","visits","share_from_previous_step","target_visits","CR","exits","exit_rate"])
     for _, row in paths.iterrows():
-        steps=row["path_steps"]
+        steps=row.get("path_steps", [])
+        if not isinstance(steps, list):
+            continue
         for i in range(len(steps)-1):
-            rows.append({"step": f"{i+1} → {i+2}", "from_url": steps[i], "to_url": steps[i+1], "visitID": row["visitID"], "target_reached": row["target_reached"]})
+            rows.append({"step": f"{i+1} → {i+2}", "from_url": steps[i], "to_url": steps[i+1], "visitID": row.get("visitID"), "target_reached": row.get("target_reached", False)})
     if not rows:
         return pd.DataFrame(columns=["step","from_url","to_url","visits","share_from_previous_step","target_visits","CR","exits","exit_rate"])
     df=pd.DataFrame(rows)
@@ -445,7 +450,8 @@ def _render_debug(visits: pd.DataFrame, hits: pd.DataFrame, selected_ids: list[s
 
 
 def _render_sankey(transitions: pd.DataFrame, top_n: int) -> None:
-    if go is None or transitions.empty:
+    required = {"from_url", "to_url", "visits"}
+    if go is None or transitions.empty or not required.issubset(transitions.columns):
         st.info("Sankey недоступен, показываем таблицу переходов.")
         return
     data = transitions.head(top_n)
@@ -458,6 +464,10 @@ def _render_sankey(transitions: pd.DataFrame, top_n: int) -> None:
 
 def _watchlist_from_paths(paths: pd.DataFrame) -> pd.DataFrame:
     rows=[]
+    cols=["reason_group","visitID","dateTime","deviceCategory","UTMSource","UTMCampaign","path","visitDuration","pageViews","reason_to_watch"]
+    required = {"target_reached", "path_length", "path", "visitID"}
+    if paths.empty or not required.issubset(paths.columns):
+        return pd.DataFrame(columns=cols)
     src = paths.copy()
     src["pageViews"] = pd.to_numeric(src.get("pageViews"), errors="coerce").fillna(0)
     src["visitDuration"] = pd.to_numeric(src.get("visitDuration"), errors="coerce").fillna(0)
@@ -471,7 +481,6 @@ def _watchlist_from_paths(paths: pd.DataFrame) -> pd.DataFrame:
     for name, frame, reason in groups:
         for _, row in frame.sort_values(["visitDuration", "pageViews"], ascending=False).head(4).iterrows():
             item = row.to_dict(); item["reason_group"] = name; item["reason_to_watch"] = reason; rows.append(item)
-    cols=["reason_group","visitID","dateTime","deviceCategory","UTMSource","UTMCampaign","path","visitDuration","pageViews","reason_to_watch"]
     return pd.DataFrame(rows)[cols] if rows else pd.DataFrame(columns=cols)
 
 
@@ -515,55 +524,79 @@ def _render_user_paths_tab(token_available: bool) -> None:
         paths = paths[paths["UTMSource"].astype(str).str.contains(utm_source, case=False, na=False)]
     if utm_campaign and "UTMCampaign" in paths:
         paths = paths[paths["UTMCampaign"].astype(str).str.contains(utm_campaign, case=False, na=False)]
+    if paths.empty:
+        st.warning("По выбранным фильтрам путей не найдено. Измените URL-фильтр, дату или режим построения пути.")
+        return
     c10,c11,c12,c13=st.columns(4)
     goal_filter=c10.selectbox("Цель", ["все","только с целью","только без цели"], key="paths_goal_filter")
     include_url=c11.text_input("Содержит URL в пути", key="paths_include")
     exclude_url=c12.text_input("Исключить URL из пути", key="paths_exclude")
     min_visits=c13.number_input("Минимум визитов в пути", min_value=1, value=1, step=1)
     top_n=st.slider("Показывать top-N путей", 5, 100, 20)
-    if goal_filter=="только с целью": paths=paths[paths["target_reached"]]
-    if goal_filter=="только без цели": paths=paths[~paths["target_reached"]]
-    if include_url: paths=paths[paths["path"].str.contains(include_url,case=False,na=False)]
-    if exclude_url: paths=paths[~paths["path"].str.contains(exclude_url,case=False,na=False)]
+    if goal_filter=="только с целью" and "target_reached" in paths: paths=paths[paths["target_reached"]]
+    if goal_filter=="только без цели" and "target_reached" in paths: paths=paths[~paths["target_reached"]]
+    if include_url and "path" in paths: paths=paths[paths["path"].str.contains(include_url,case=False,na=False)]
+    if exclude_url and "path" in paths: paths=paths[~paths["path"].str.contains(exclude_url,case=False,na=False)]
     if paths.empty:
-        st.warning("По выбранным фильтрам данных нет."); return
-    total=len(paths); target=int(paths["target_reached"].sum())
+        st.warning("По выбранным фильтрам путей не найдено. Измените URL-фильтр, дату или режим построения пути."); return
+    total=len(paths); target=int(paths["target_reached"].sum()) if "target_reached" in paths else 0
     m=st.columns(7)
     m[0].metric("Визиты", total); m[1].metric("Целевые визиты", target); m[2].metric("CR", f"{target/total:.2%}")
-    m[3].metric("Средняя глубина", f"{paths['path_length'].mean():.1f}"); m[4].metric("Средняя длительность", f"{pd.to_numeric(paths.get('visitDuration'), errors='coerce').mean():.0f} сек")
-    agg=_aggregate_paths(paths); agg=agg[agg["visits"]>=min_visits]
-    m[5].metric("Уникальные пути", len(agg)); m[6].metric("Выход после 1 шага", f"{paths['exit_after_first'].mean():.2%}")
+    m[3].metric("Средняя глубина", f"{paths['path_length'].mean():.1f}" if "path_length" in paths else "—"); m[4].metric("Средняя длительность", f"{pd.to_numeric(paths.get('visitDuration'), errors='coerce').mean():.0f} сек")
+    agg=_aggregate_paths(paths); agg=agg[agg["visits"]>=min_visits] if "visits" in agg else agg
+    m[5].metric("Уникальные пути", len(agg)); m[6].metric("Выход после 1 шага", f"{paths['exit_after_first'].mean():.2%}" if "exit_after_first" in paths else "—")
     if target == 0: st.warning("Выбранные цели не найдены в этой выборке.")
     trans=_transitions(paths)
     st.subheader("Интерактивный flow-отчет")
-    _render_sankey(trans, top_n)
-    step=st.selectbox("Шаг перехода", sorted(trans["step"].unique().tolist()) if not trans.empty else [])
-    if step: st.dataframe(trans[trans["step"]==step].head(top_n), use_container_width=True, hide_index=True)
+    if trans.empty:
+        st.info("Переходов между страницами не найдено: в выборке пути состоят из одного шага или hits не содержат цепочку URL.")
+    else:
+        _render_sankey(trans, top_n)
+        step_options = sorted(trans["step"].dropna().unique().tolist()) if "step" in trans else []
+        if step_options:
+            step=st.selectbox("Шаг перехода", step_options)
+            if step: st.dataframe(trans[trans["step"]==step].head(top_n), use_container_width=True, hide_index=True)
     st.subheader("Топ путей")
-    preset=st.selectbox("Фильтр путей", ["все пути","только с целью","только без цели","только пути с выходом","только пути через /prices/","только пути через /register/ или /create/","только длинные пути"])
-    top=agg.copy()
-    if preset=="только с целью": top=top[top["target_visits"]>0]
-    elif preset=="только без цели": top=top[top["target_visits"]==0]
-    elif preset=="только пути с выходом": top=top[top["exits"]>0]
-    elif preset=="только пути через /prices/": top=top[top["path"].str.contains("/prices/|/prices|pricing", case=False, na=False)]
-    elif preset=="только пути через /register/ или /create/": top=top[top["path"].str.contains("/register/|/register|/create/|/create", case=False, na=False)]
-    elif preset=="только длинные пути": top=top[top["path"].str.count("→")>=3]
-    st.dataframe(top.head(top_n), use_container_width=True, hide_index=True)
+    if agg.empty:
+        st.info("Топ путей не построен: после фильтров не осталось агрегированных путей.")
+    else:
+        preset=st.selectbox("Фильтр путей", ["все пути","только с целью","только без цели","только пути с выходом","только пути через /prices/","только пути через /register/ или /create/","только длинные пути"])
+        top=agg.copy()
+        if preset=="только с целью" and "target_visits" in top: top=top[top["target_visits"]>0]
+        elif preset=="только без цели" and "target_visits" in top: top=top[top["target_visits"]==0]
+        elif preset=="только пути с выходом" and "exits" in top: top=top[top["exits"]>0]
+        elif preset=="только пути через /prices/" and "path" in top: top=top[top["path"].str.contains("/prices/|/prices|pricing", case=False, na=False)]
+        elif preset=="только пути через /register/ или /create/" and "path" in top: top=top[top["path"].str.contains("/register/|/register|/create/|/create", case=False, na=False)]
+        elif preset=="только длинные пути" and "path" in top: top=top[top["path"].str.count("→")>=3]
+        st.dataframe(top.head(top_n), use_container_width=True, hide_index=True)
     st.subheader("Конвертеры vs неконвертеры")
-    l,r=st.columns(2); l.dataframe(_aggregate_paths(paths[paths["target_reached"]]).rename(columns={"avg_visitDuration":"avg_duration"}).head(10), use_container_width=True, hide_index=True); r.dataframe(_aggregate_paths(paths[~paths["target_reached"]]).rename(columns={"avg_visitDuration":"avg_duration"}).head(10), use_container_width=True, hide_index=True)
+    if "target_reached" in paths:
+        l,r=st.columns(2); l.dataframe(_aggregate_paths(paths[paths["target_reached"]]).rename(columns={"avg_visitDuration":"avg_duration"}).head(10), use_container_width=True, hide_index=True); r.dataframe(_aggregate_paths(paths[~paths["target_reached"]]).rename(columns={"avg_visitDuration":"avg_duration"}).head(10), use_container_width=True, hide_index=True)
+    else:
+        st.info("Нет колонки target_reached для разбивки на конвертеров и неконвертеров.")
     st.subheader("Куда уходят после выбранной страницы")
     next_rows=[]
-    for _, row in paths.iterrows():
-        steps=row["path_steps"]; next_rows.append({"next_url": steps[1] if len(steps)>1 else "Выход", "visitID": row["visitID"], "target_reached": row["target_reached"], "exit": len(steps)<=1})
-    nt=pd.DataFrame(next_rows).groupby("next_url").agg(visits=("visitID","nunique"), target_visits=("target_reached","sum"), exits=("exit","sum")).reset_index(); nt["share"]=nt["visits"]/nt["visits"].sum(); nt["CR"]=nt["target_visits"]/nt["visits"]; nt["exit_rate"]=nt["exits"]/nt["visits"]
-    st.dataframe(nt.sort_values("visits", ascending=False).head(top_n), use_container_width=True, hide_index=True)
+    if {"path_steps", "visitID", "target_reached"}.issubset(paths.columns):
+        for _, row in paths.iterrows():
+            steps=row.get("path_steps", [])
+            if isinstance(steps, list):
+                next_rows.append({"next_url": steps[1] if len(steps)>1 else "Выход", "visitID": row.get("visitID"), "target_reached": row.get("target_reached", False), "exit": len(steps)<=1})
+    if next_rows:
+        nt=pd.DataFrame(next_rows).groupby("next_url").agg(visits=("visitID","nunique"), target_visits=("target_reached","sum"), exits=("exit","sum")).reset_index(); nt["share"]=nt["visits"]/nt["visits"].sum(); nt["CR"]=nt["target_visits"]/nt["visits"]; nt["exit_rate"]=nt["exits"]/nt["visits"]
+        st.dataframe(nt.sort_values("visits", ascending=False).head(top_n), use_container_width=True, hide_index=True)
+    else:
+        st.info("Нет данных для расчета следующего URL.")
     st.subheader("Где пользователи отваливаются")
     drop=[]
-    for n in range(1, int(max_steps)+1):
-        for url in paths["path_steps"].map(lambda x: x[n-1] if len(x)>=n else None).dropna().unique():
-            at=paths[paths["path_steps"].map(lambda x: len(x)>=n and x[n-1]==url)]; ex=at[at["path_steps"].map(len)==n]
-            drop.append({"step_number":n,"current_url":url,"exits":len(ex),"exit_rate":len(ex)/max(len(at),1),"visits_at_step":len(at),"target_visits_from_this_step":int(at["target_reached"].sum()),"CR":at["target_reached"].mean()})
-    st.dataframe(pd.DataFrame(drop).sort_values(["exits","visits_at_step"], ascending=False).head(top_n), use_container_width=True, hide_index=True)
+    if {"path_steps", "target_reached"}.issubset(paths.columns):
+        for n in range(1, int(max_steps)+1):
+            for url in paths["path_steps"].map(lambda x: x[n-1] if isinstance(x, list) and len(x)>=n else None).dropna().unique():
+                at=paths[paths["path_steps"].map(lambda x: isinstance(x, list) and len(x)>=n and x[n-1]==url)]; ex=at[at["path_steps"].map(lambda x: isinstance(x, list) and len(x)==n)]
+                drop.append({"step_number":n,"current_url":url,"exits":len(ex),"exit_rate":len(ex)/max(len(at),1),"visits_at_step":len(at),"target_visits_from_this_step":int(at["target_reached"].sum()),"CR":at["target_reached"].mean()})
+    if drop:
+        st.dataframe(pd.DataFrame(drop).sort_values(["exits","visits_at_step"], ascending=False).head(top_n), use_container_width=True, hide_index=True)
+    else:
+        st.info("Нет данных для расчета dropoff.")
     st.subheader("Записи для просмотра в Вебвизоре")
     st.dataframe(_watchlist_from_paths(paths), use_container_width=True, hide_index=True)
     with st.expander("Отладка", expanded=False):
@@ -612,7 +645,11 @@ def main() -> None:
             _render_debug(visits, hits, selected_ids)
 
     with paths_tab:
-        _render_user_paths_tab(token_available)
+        try:
+            _render_user_paths_tab(token_available)
+        except Exception as exc:
+            st.error("Ошибка в отчете по путям пользователей")
+            st.exception(exc)
 
     if EXPERIMENTAL_MODE:
         st.divider()
