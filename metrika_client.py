@@ -64,6 +64,18 @@ class MetrikaLogsClient:
         self.session = requests.Session()
         self.session.headers.update({"Authorization": f"OAuth {self.token}", "Accept-Encoding": "gzip"})
 
+    def fetch_visits(
+        self,
+        counter_id: int,
+        date_from: str,
+        date_to: str,
+        url_contains: str,
+        url_search_scope: str = "start_or_end",
+    ) -> pd.DataFrame:
+        """Fetch only visits for the stable application flow."""
+        visits_filter = self._url_filter("visits", url_contains, url_search_scope)
+        return self.fetch_log(counter_id, "visits", date_from, date_to, VISIT_FIELDS, visits_filter).dataframe
+
     def fetch_visits_and_hits(
         self,
         counter_id: int,
@@ -73,8 +85,7 @@ class MetrikaLogsClient:
         load_hits: bool = False,
         url_search_scope: str = "start_or_end",
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
-        visits_filter = self._url_filter("visits", url_contains, url_search_scope)
-        visits = self.fetch_log(counter_id, "visits", date_from, date_to, VISIT_FIELDS, visits_filter).dataframe
+        visits = self.fetch_visits(counter_id, date_from, date_to, url_contains, url_search_scope)
         if not load_hits:
             return visits, pd.DataFrame()
         hits_filter = self._url_filter("hits", url_contains, url_search_scope)
