@@ -314,48 +314,83 @@ def _segment_mask(df: pd.DataFrame, segment_type: str, segment_name: str) -> pd.
     return labels.eq(str(segment_name))
 
 
-def select_records_to_watch(scored: pd.DataFrame, problem_segments: pd.DataFrame, per_segment: int = 5) -> pd.DataFrame:
-    df = scored.copy()
-    if df.empty or problem_segments.empty:
-        return pd.DataFrame()
-    rows = []
-    for _, seg in problem_segments.head(5).iterrows():
-        mask = _segment_mask(df, str(seg["segment_type"]), str(seg["segment_name"]))
-        pool = df[mask].copy()
-        if "registered" in pool:
-            pool = pool[~pool["registered"].astype(bool)]
-        if pool.empty:
-            continue
-        pool["visitDuration"] = _numeric(pool.get("visitDuration"), pool.index)
-        selected = []
-        high = pool.sort_values("visitDuration", ascending=False).head(2)
-        selected.append((high, "длинный визит в проблемном сегменте"))
-        rest = pool.drop(index=high.index, errors="ignore")
-        if not rest.empty:
-            median = rest["visitDuration"].median()
-            mid = rest.assign(_dist=(rest["visitDuration"] - median).abs()).sort_values("_dist").head(2).drop(columns=["_dist"])
-            selected.append((mid, "типичный по длительности визит в проблемном сегменте"))
-            rest = rest.drop(index=mid.index, errors="ignore")
-        short = rest[(rest["visitDuration"] <= 15) | (pd.to_numeric(rest.get("pageViews", 0), errors="coerce").fillna(0) <= 1)].sort_values("visitDuration").head(1)
-        if not short.empty:
-            selected.append((short, "короткий отказной визит в проблемном сегменте"))
-        picked = pd.concat([x[0].assign(_watch_type=x[1]) for x in selected if not x[0].empty]).head(per_segment)
-        for _, row in picked.iterrows():
-            reason = (
-                f"Представитель проблемного сегмента {seg['segment_name']}: CR сегмента {seg['CR']}% ниже среднего {seg['baseline_CR']}%, "
-                f"визит {_duration_ru(row.get('visitDuration'))}, {int(float(row.get('pageViews') or 0))} просмотра(ов), регистрации нет. {row.get('_watch_type')}."
-            )
-            item = {"segment_name": seg["segment_name"], "priority_score": seg["priority_score"], "reason_to_watch": reason}
-            for col in ["visitID", "dateTime", "deviceCategory", "UTMSource", "UTMCampaign", "startURL", "endURL", "visitDuration", "pageViews", "goalsID"]:
-                item[col] = row.get(col, "")
-            rows.append(item)
-    return pd.DataFrame(rows)
+def _simple_watch_reason(row: pd.Series, watch_type: str) -> str:
+    if watch_type == "short_bounce":
+        return "Короткий отказ с лендинга — проверить первый экран и понятность оффера"
+    if watch_type == "long_visit":
+        return "Длинный визит без регистрации — проверить, видел ли CTA и куда скроллил"
+    if watch_type == "multi_page":
+        return "2+ просмотра без регистрации — проверить, куда ушел после лендинга"
+    if watch_type == "important_campaign":
+        return "Визит из важной кампании без регистрации — проверить соответствие объявления, первого экрана и CTA"
+    return "Визит без регистрации — посмотреть запись и найти момент, где пользователь теряет намерение"
 
+
+def _important_campaigns(df: pd.DataFrame) -> set[str]:
+    if "UTMCampaign" not in df:
+        return set()
+    campaigns = _text_series(df, "UTMCampaign")
+    non_empty = campaigns[campaigns.str.strip().ne("")]
+    if non_empty.empty:
+        return set()
+    counts = non_empty.value_counts()
+    top_count = max(1, min(5, len(counts)))
+    return set(counts.head(top_count).index.astype(str))
+
+
+def select_records_to_watch(scored: pd.DataFrame, problem_segments: pd.DataFrame | None = None, per_segment: int = 5, limit: int = 20) -> pd.DataFrame:
+    """Select 10-20 non-registration visits for manual Webvisor review.
+
+    The default path does not depend on segment analysis: it creates a balanced
+    queue of long visits, short bounces, 2+ page visits, and visits from larger
+    campaigns. ``problem_segments`` and ``per_segment`` are accepted for
+    backwards compatibility with older app code.
+    """
+    df = scored.copy()
+    if df.empty:
+        return pd.DataFrame()
+    if "registered" in df:
+        df = df[~df["registered"].astype(bool)].copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    df["visitDuration"] = _numeric(df.get("visitDuration"), df.index)
+    df["pageViews"] = _numeric(df.get("pageViews"), df.index)
+    campaigns = _text_series(df, "UTMCampaign")
+    important_campaigns = _important_campaigns(df)
+    selected_parts: list[pd.DataFrame] = []
+
+    long_visits = df[df["visitDuration"] >= max(60, df["visitDuration"].quantile(0.75))].sort_values(["visitDuration", "pageViews"], ascending=False).head(5)
+    selected_parts.append(long_visits.assign(_watch_type="long_visit"))
+
+    rest = df.drop(index=long_visits.index, errors="ignore")
+    short_bounces = rest[(rest["visitDuration"] <= 15) & (rest["pageViews"] <= 1)].sort_values("visitDuration").head(5)
+    selected_parts.append(short_bounces.assign(_watch_type="short_bounce"))
+
+    rest = rest.drop(index=short_bounces.index, errors="ignore")
+    multi_page = rest[rest["pageViews"] >= 2].sort_values(["pageViews", "visitDuration"], ascending=False).head(5)
+    selected_parts.append(multi_page.assign(_watch_type="multi_page"))
+
+    rest = rest.drop(index=multi_page.index, errors="ignore")
+    important_campaign = rest[campaigns.reindex(rest.index).astype(str).isin(important_campaigns)].sort_values(["visitDuration", "pageViews"], ascending=False).head(5)
+    selected_parts.append(important_campaign.assign(_watch_type="important_campaign"))
+
+    picked = pd.concat([part for part in selected_parts if not part.empty], sort=False) if selected_parts else pd.DataFrame()
+    if len(picked) < min(limit, len(df)):
+        filler = df.drop(index=picked.index, errors="ignore").sort_values(["visitDuration", "pageViews"], ascending=False).head(limit - len(picked))
+        picked = pd.concat([picked, filler.assign(_watch_type="fallback")], sort=False)
+
+    picked = picked.head(limit).copy()
+    picked["reason_to_watch"] = picked.apply(lambda row: _simple_watch_reason(row, str(row.get("_watch_type", "fallback"))), axis=1)
+    cols = [c for c in ["visitID", "dateTime", "deviceCategory", "UTMSource", "UTMCampaign", "startURL", "endURL", "visitDuration", "pageViews", "reason_to_watch"] if c in picked]
+    return picked[cols].reset_index(drop=True)
 
 def webvisor_filter_table(records: pd.DataFrame) -> pd.DataFrame:
     if records.empty:
         return pd.DataFrame()
     tmp = records.copy()
+    if "segment_name" not in tmp:
+        tmp["segment_name"] = "записи для ручного просмотра"
     tmp["date"] = pd.to_datetime(tmp.get("dateTime"), errors="coerce").dt.date.astype(str)
     return tmp.groupby("segment_name", dropna=False).agg(
         date=("date", lambda s: ", ".join(sorted(set(x for x in s if x != "NaT")))[:200]),

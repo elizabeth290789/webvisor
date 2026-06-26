@@ -90,3 +90,28 @@ def _rule_summary(problem_segments: pd.DataFrame, sample: pd.DataFrame) -> str:
     lines.append("- Проверить, возникает ли непонимание оффера, техническая ошибка, неработающий CTA, неудобство на конкретном устройстве или несоответствие UTM-обещания странице входа.")
     lines.append("- Не трактовать длинную длительность или 2+ просмотра как самостоятельный инсайт: это только признак интереса внутри сегмента с CR ниже базы.")
     return "\n".join(lines)
+
+
+def build_recommendations(baseline: dict[str, float], records_to_watch: pd.DataFrame, enough_for_segments: bool) -> str:
+    """Return short plain-language guidance for the simplified UX."""
+    visits = int(baseline.get("total_visits", 0))
+    regs = int(baseline.get("registrations", 0))
+    cr = float(baseline.get("registration_cr", 0)) * 100
+    count = 0 if records_to_watch is None or records_to_watch.empty else len(records_to_watch)
+    lines = [
+        "### Краткие рекомендации",
+        f"- Сейчас в выборке {visits} визитов, {regs} регистраций, CR {cr:.2f}%.",
+    ]
+    if count:
+        lines.append(f"- Начните с {count} записей из таблицы выше: это не доказательство проблемы, а очередь для ручного просмотра.")
+    else:
+        lines.append("- Очередь записей пустая: проверьте фильтры, период или ID целей регистрации.")
+    lines.extend([
+        "- В каждой записи фиксируйте только наблюдаемые факты: первый экран, скролл до CTA, клики, форму, URL ухода.",
+        "- Не сравнивайте сегменты и не формулируйте выводы о просадке CR, пока выборка не пройдет пороги достаточности.",
+    ])
+    if enough_for_segments:
+        lines.append("- Выборка прошла строгий порог для сегментного анализа: смотрите блок с возможными проблемами ниже.")
+    else:
+        lines.append("- Для сегментного анализа нужно минимум 300 визитов, 20 регистраций и ненулевой CR.")
+    return "\n".join(lines)

@@ -7,13 +7,21 @@ import streamlit as st
 
 st.set_page_config(page_title="Webvisor Session Triage", layout="wide")
 st.title("Отбор записей Вебвизора для ручного просмотра")
-st.caption("Приложение выгружает visits/hits из Logs API, ищет проблемные сегменты с CR ниже базового уровня и подбирает visitID для просмотра в Вебвизоре.")
+st.caption("Честный помощник: сначала проверяет, хватает ли данных для выводов, затем подбирает записи для просмотра в Вебвизоре.")
 
 try:
     from demo_data import build_demo_visits_and_hits
     from metrika_client import MetrikaAPIError, MetrikaLogsClient, get_metrika_token
-    from scoring import aggregate_stats, analyze_hits, baseline_metrics, find_problem_segments, score_sessions, select_records_to_watch, webvisor_filter_table
-    from summarizer import build_summary
+    from scoring import (
+        aggregate_stats,
+        analyze_hits,
+        baseline_metrics,
+        find_problem_segments,
+        score_sessions,
+        select_records_to_watch,
+        webvisor_filter_table,
+    )
+    from summarizer import build_recommendations
 except Exception as exc:
     st.error("Ошибка при импорте модулей приложения. Проверьте зависимости и конфигурацию деплоя.")
     st.exception(exc)
@@ -31,6 +39,22 @@ URL_WITHOUT_HITS_HELP = (
     "Без загрузки hits приложение видит только startURL и endURL визита. "
     "Чтобы искать посещение страницы внутри визита, включите загрузку hits."
 )
+INSUFFICIENT_DATA_WARNING = (
+    "Данных недостаточно для сравнения сегментов. Можно только отобрать записи для ручного просмотра, "
+    "но нельзя делать выводы о просадках CR."
+)
+WATCH_COLUMNS = [
+    "visitID",
+    "dateTime",
+    "deviceCategory",
+    "UTMSource",
+    "UTMCampaign",
+    "startURL",
+    "endURL",
+    "visitDuration",
+    "pageViews",
+    "reason_to_watch",
+]
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -79,6 +103,47 @@ def filter_by_url(scored: pd.DataFrame, hits: pd.DataFrame, url_contains: str, u
     return scored[start_match | end_match]
 
 
+def _sample_period(df: pd.DataFrame) -> str:
+    if df.empty or "dateTime" not in df:
+        return "не определен"
+    dates = pd.to_datetime(df["dateTime"], errors="coerce").dropna()
+    if dates.empty:
+        return "не определен"
+    return f"{dates.min():%Y-%m-%d %H:%M} — {dates.max():%Y-%m-%d %H:%M}"
+
+
+def _nunique(df: pd.DataFrame, col: str) -> int:
+    if col not in df:
+        return 0
+    values = df[col].fillna("").astype(str)
+    return int(values[values.ne("")].nunique())
+
+
+def _render_sample_status(filtered: pd.DataFrame, url_contains: str) -> tuple[dict[str, float], bool, bool]:
+    baseline = baseline_metrics(filtered)
+    visits = int(baseline["total_visits"])
+    registrations = int(baseline["registrations"])
+    cr = float(baseline["registration_cr"])
+    enough_for_manual = visits >= 100 and registrations >= 10 and cr > 0
+    enough_for_segments = visits >= 300 and registrations >= 20 and cr > 0
+
+    st.subheader("1. Можно ли делать выводы?")
+    c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+    c1.metric("визиты", visits)
+    c2.metric("регистрации", registrations)
+    c3.metric("CR", f"{cr * 100:.2f}%")
+    c4.metric("устройств", _nunique(filtered, "deviceCategory"))
+    c5.metric("кампаний", _nunique(filtered, "UTMCampaign"))
+    c6.metric("период", _sample_period(filtered))
+    c7.metric("URL-фильтр", url_contains or "не задан")
+
+    if not enough_for_manual:
+        st.warning(INSUFFICIENT_DATA_WARNING, icon="⚠️")
+    else:
+        st.success("Данных достаточно для аккуратного отбора записей и базовой проверки сегментов. Для сегментного анализа используется более строгий порог: 300 визитов и 20 регистраций.")
+    return baseline, enough_for_manual, enough_for_segments
+
+
 def main() -> None:
     demo_mode = not bool(get_metrika_token())
     if demo_mode:
@@ -93,50 +158,28 @@ def main() -> None:
 
     with st.sidebar:
         st.header("Параметры")
+        simple_mode = st.toggle("Простой режим", value=True, help="Показывает только статус выборки, записи для просмотра и краткие рекомендации.")
         counter_id = st.number_input("counter_id", min_value=1, value=18477952, step=1)
         today = dt.date.today()
         yesterday = today - dt.timedelta(days=1)
         date_from = st.date_input("date_from", yesterday, max_value=yesterday)
         date_to = st.date_input("date_to", yesterday, max_value=yesterday)
         st.caption("Для больших счетчиков лучше выбирать один завершенный день. Текущий день может быть недоступен или неполным в Logs API.")
-        if date_to > date_from and (date_to - date_from).days + 1 > 1:
-            st.warning("Вы выбрали период больше 1 дня. Для большого счетчика выгрузка может занять много времени. Рекомендуем начать с одного дня и URL-фильтра.")
-        load_hits = st.checkbox(
-            "Загружать hits",
-            value=False,
-            help="Выключено по умолчанию для быстрой выгрузки больших счетчиков.",
-        )
-        url_search_label = st.selectbox(
-            "Где искать URL",
-            list(URL_SEARCH_OPTIONS),
-            index=list(URL_SEARCH_OPTIONS).index(DEFAULT_URL_SEARCH_LABEL),
-        )
+        load_hits = st.checkbox("Загружать hits", value=False, help="Выключено по умолчанию для быстрой выгрузки больших счетчиков.")
+        url_search_label = st.selectbox("Где искать URL", list(URL_SEARCH_OPTIONS), index=list(URL_SEARCH_OPTIONS).index(DEFAULT_URL_SEARCH_LABEL))
         url_search_scope = URL_SEARCH_OPTIONS[url_search_label]
-        url_field_label = "URL содержит *" if load_hits else "URL входа или выхода содержит *"
-        url_contains_load = st.text_input(
-            url_field_label,
-            value="chat",
-            help="Обязательный фильтр: применяется в Logs API до скачивания данных.",
-        )
+        url_contains_load = st.text_input("URL содержит *" if load_hits else "URL входа или выхода содержит *", value="chat", help="Обязательный фильтр: применяется в Logs API до скачивания данных.")
         st.caption(URL_WITHOUT_HITS_HELP)
         if url_search_scope == "any_hit" and not load_hits:
             st.warning("Поиск по любому URL внутри визита доступен только при включенной загрузке hits.")
-        reg_goals = st.text_input(
-            "ID целей регистрации через запятую",
-            value="2898778",
-            help="Если оставить пустым, любая сессия считается без регистрации для правил регистрации.",
-        )
-        if demo_mode:
-            st.info("Сейчас приложение работает на демо-данных. Поля ниже нужны для реальной Метрики после добавления токена.")
-            load_label = "Обновить демо-данные"
-        else:
-            load_label = "Загрузить и посчитать"
-        load = st.button(load_label, type="primary")
+        reg_goals = st.text_input("ID целей регистрации через запятую", value="2898778")
+        load = st.button("Обновить демо-данные" if demo_mode else "Загрузить и посчитать", type="primary")
 
     if load and demo_mode:
         st.session_state["scored"] = load_demo_score([x.strip() for x in reg_goals.split(",") if x.strip()] or ["1001"])
         st.session_state["hits"] = build_demo_visits_and_hits()[1]
         st.session_state["url_search_scope"] = url_search_scope
+        st.session_state["url_contains_load"] = url_contains_load.strip()
     elif load:
         if date_to < date_from:
             st.error("date_to должен быть не раньше date_from.")
@@ -148,58 +191,36 @@ def main() -> None:
             try:
                 with st.spinner("Создаем requests в Logs API и скачиваем parts..."):
                     st.session_state["url_contains_load"] = url_contains_load.strip()
-                    visits_df, hits_df = load_data(
-                        int(counter_id),
-                        str(date_from),
-                        str(date_to),
-                        url_contains_load.strip(),
-                        load_hits,
-                        url_search_scope,
-                    )
-                    st.session_state["scored"] = score_sessions(
-                        visits_df,
-                        hits_df,
-                        [x.strip() for x in reg_goals.split(",") if x.strip()],
-                    )
+                    visits_df, hits_df = load_data(int(counter_id), str(date_from), str(date_to), url_contains_load.strip(), load_hits, url_search_scope)
+                    st.session_state["scored"] = score_sessions(visits_df, hits_df, [x.strip() for x in reg_goals.split(",") if x.strip()])
                     st.session_state["hits"] = hits_df
                     st.session_state["url_search_scope"] = url_search_scope
             except MetrikaAPIError as exc:
                 st.error(str(exc))
             except Exception as exc:
                 st.exception(exc)
+
     scored = st.session_state.get("scored")
     if scored is None:
         st.info("Введите параметры и нажмите «Загрузить и посчитать». Если YANDEX_METRIKA_TOKEN не задан, приложение покажет демо-данные.")
         st.stop()
 
-    st.subheader("Фильтры")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        device_filter = st.selectbox("Устройство", ["Все", "mobile", "desktop", "tablet"])
-        no_reg_only = st.checkbox("Только без регистрации", value=False, help="Для поиска проблемных сегментов лучше оставить всю выборку, чтобы корректно считать CR.")
-    with col2:
-        filter_hits_loaded = not st.session_state.get("hits", pd.DataFrame()).empty
-        current_scope = st.session_state.get("url_search_scope", URL_SEARCH_OPTIONS[DEFAULT_URL_SEARCH_LABEL])
-        current_label = next(
-            (label for label, scope in URL_SEARCH_OPTIONS.items() if scope == current_scope),
-            DEFAULT_URL_SEARCH_LABEL,
-        )
-        filter_url_search_label = st.selectbox(
-            "Где искать URL",
-            list(URL_SEARCH_OPTIONS),
-            index=list(URL_SEARCH_OPTIONS).index(current_label),
-            key="filter_url_search_label",
-        )
-        filter_url_search_scope = URL_SEARCH_OPTIONS[filter_url_search_label]
-        filter_url_label = "URL содержит" if filter_hits_loaded else "URL входа или выхода содержит"
-        url_contains = st.text_input(filter_url_label, value=st.session_state.get("url_contains_load", ""))
-        st.caption(URL_WITHOUT_HITS_HELP)
-        if filter_url_search_scope == "any_hit" and not filter_hits_loaded:
-            st.warning("Поиск по любому URL внутри визита доступен только при включенной загрузке hits.")
-        utm_contains = st.text_input("UTM campaign содержит")
-    with col3:
-        min_segment_visits = st.number_input("минимум визитов в сегменте", min_value=1, value=3)
-        min_duration = st.number_input("длительность больше N секунд", min_value=0, value=0)
+    with st.expander("Фильтры выборки", expanded=not simple_mode):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            device_filter = st.selectbox("Устройство", ["Все", "mobile", "desktop", "tablet"])
+            no_reg_only = st.checkbox("Только без регистрации", value=False, help="Для анализа CR оставьте всю выборку.")
+        with col2:
+            filter_hits_loaded = not st.session_state.get("hits", pd.DataFrame()).empty
+            current_scope = st.session_state.get("url_search_scope", URL_SEARCH_OPTIONS[DEFAULT_URL_SEARCH_LABEL])
+            current_label = next((label for label, scope in URL_SEARCH_OPTIONS.items() if scope == current_scope), DEFAULT_URL_SEARCH_LABEL)
+            filter_url_search_label = st.selectbox("Где искать URL", list(URL_SEARCH_OPTIONS), index=list(URL_SEARCH_OPTIONS).index(current_label), key="filter_url_search_label")
+            filter_url_search_scope = URL_SEARCH_OPTIONS[filter_url_search_label]
+            url_contains = st.text_input("URL содержит" if filter_hits_loaded else "URL входа или выхода содержит", value=st.session_state.get("url_contains_load", ""))
+            utm_contains = st.text_input("UTM campaign содержит")
+        with col3:
+            min_segment_visits = st.number_input("минимум визитов в сегменте", min_value=1, value=10)
+            min_duration = st.number_input("длительность больше N секунд", min_value=0, value=0)
 
     filtered = scored.copy()
     if device_filter != "Все" and "deviceCategory" in filtered:
@@ -207,91 +228,65 @@ def main() -> None:
     if no_reg_only and "registered" in filtered:
         filtered = filtered[~filtered["registered"]]
     if url_contains:
-        filtered = filter_by_url(
-            filtered,
-            st.session_state.get("hits", pd.DataFrame()),
-            url_contains,
-            filter_url_search_scope,
-        )
+        filtered = filter_by_url(filtered, st.session_state.get("hits", pd.DataFrame()), url_contains, filter_url_search_scope)
     if utm_contains and "UTMCampaign" in filtered:
         filtered = filtered[filtered["UTMCampaign"].astype(str).str.contains(utm_contains, case=False, na=False)]
-    filtered = filtered[(pd.to_numeric(filtered.get("visitDuration", 0), errors="coerce").fillna(0) >= min_duration)]
+    filtered = filtered[pd.to_numeric(filtered.get("visitDuration", 0), errors="coerce").fillna(0) >= min_duration]
 
-    baseline = baseline_metrics(filtered)
-    problem_segments = find_problem_segments(filtered, int(min_segment_visits))
-    records_to_watch = select_records_to_watch(filtered, problem_segments)
+    baseline, _, enough_for_segments = _render_sample_status(filtered, url_contains)
 
-    st.subheader("Базовый CR выбранной выборки")
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("total visits", int(baseline["total_visits"]))
-    m2.metric("registrations", int(baseline["registrations"]))
-    m3.metric("registration CR", f"{baseline['registration_cr'] * 100:.2f}%")
-    m4.metric("avg visitDuration", f"{baseline['avg_visitDuration']:.1f} сек")
-    m5.metric("avg pageViews", f"{baseline['avg_pageViews']:.1f}")
-
-    st.subheader("Главный вывод")
-    st.markdown(build_summary(problem_segments, filtered))
-
-    st.subheader("Проблемные сегменты")
-    st.dataframe(problem_segments, use_container_width=True, hide_index=True)
-    st.download_button("CSV: проблемные сегменты", csv_bytes(problem_segments), "problem_segments.csv", "text/csv")
-
-    st.subheader("Группировки")
-    stats = aggregate_stats(filtered)
-    for title, table in stats.items():
-        with st.expander(title, expanded=title in {"По устройствам", "deviceCategory × UTMCampaign"}):
-            st.dataframe(table, use_container_width=True, hide_index=True)
-
-    st.subheader("Записи для просмотра")
-    show_cols = [c for c in [
-        "segment_name", "priority_score", "visitID", "dateTime", "deviceCategory", "UTMSource", "UTMCampaign", "startURL", "endURL",
-        "visitDuration", "pageViews", "goalsID", "reason_to_watch"
-    ] if c in records_to_watch]
-    st.dataframe(records_to_watch[show_cols] if show_cols else records_to_watch, use_container_width=True, hide_index=True)
-    st.download_button("CSV: записи для просмотра", csv_bytes(records_to_watch[show_cols] if show_cols else records_to_watch), "webvisor_records_to_watch.csv", "text/csv")
-
-    st.subheader("Что фильтровать в Вебвизоре")
-    webvisor_filters = webvisor_filter_table(records_to_watch)
-    st.dataframe(webvisor_filters, use_container_width=True, hide_index=True)
-
-    st.subheader("Анализ hits")
-    hits_analysis = analyze_hits(st.session_state.get("hits", pd.DataFrame()), filtered)
-    if "warning" in hits_analysis:
-        st.warning(str(hits_analysis["warning"]))
+    st.subheader("2. Что смотреть в Вебвизоре")
+    records_to_watch = select_records_to_watch(filtered, limit=20)
+    watch_cols = [c for c in WATCH_COLUMNS if c in records_to_watch]
+    if records_to_watch.empty:
+        st.info("Нет неконверсионных визитов для отбора. Проверьте фильтры или ID целей регистрации.")
     else:
-        c_hits1, c_hits2 = st.columns(2)
-        with c_hits1:
-            st.caption("Были ли просмотры нескольких URL")
-            st.dataframe(hits_analysis["per_visit"], use_container_width=True, hide_index=True)
-            st.caption("Какие URL чаще встречаются в цепочке")
-            st.dataframe(hits_analysis["url_freq"], use_container_width=True, hide_index=True)
-            st.caption("Самые частые цепочки URL у неконвертеров")
-            st.dataframe(hits_analysis.get("nonconverter_chains", pd.DataFrame()), use_container_width=True, hide_index=True)
-            st.caption("Цепочки URL у конвертеров")
-            st.dataframe(hits_analysis.get("converter_chains", pd.DataFrame()), use_container_width=True, hide_index=True)
-        with c_hits2:
-            st.caption("Где пользователи уходят")
-            st.dataframe(hits_analysis["exits"], use_container_width=True, hide_index=True)
-            st.caption("EndURL у визитов без регистрации")
-            st.dataframe(hits_analysis.get("nonconverter_end_urls", pd.DataFrame()), use_container_width=True, hide_index=True)
-            st.caption("Куда уходят после выбранных URL входа")
-            st.dataframe(hits_analysis.get("after_selected_url", pd.DataFrame()), use_container_width=True, hide_index=True)
-            st.caption("Цели/события в hits")
-            event_freq = hits_analysis.get("event_freq", pd.DataFrame())
-            if isinstance(event_freq, pd.DataFrame) and not event_freq.empty:
-                st.dataframe(event_freq, use_container_width=True, hide_index=True)
-            else:
-                st.info("В hits не найдены цели или события в доступных полях.")
+        st.dataframe(records_to_watch[watch_cols], use_container_width=True, hide_index=True)
+        st.download_button("CSV: записи для просмотра", csv_bytes(records_to_watch[watch_cols]), "webvisor_records_to_watch.csv", "text/csv")
 
-    st.subheader("Экспорт")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.download_button("CSV: проблемные сегменты", csv_bytes(problem_segments), "problem_segments_export.csv", "text/csv")
-    with c2:
-        st.download_button("CSV: все визиты со score", csv_bytes(scored), "all_scored_visits.csv", "text/csv")
-    with c3:
-        combined = pd.concat({k: v for k, v in stats.items() if not v.empty}, names=["group"]).reset_index(level=0) if stats else pd.DataFrame()
-        st.download_button("CSV: агрегаты", csv_bytes(combined), "aggregated_stats.csv", "text/csv")
+    st.markdown(build_recommendations(baseline, records_to_watch, enough_for_segments))
+
+    st.subheader("3. Сегменты с возможной проблемой")
+    problem_segments = pd.DataFrame()
+    if enough_for_segments:
+        min_visits = max(int(min_segment_visits), int(baseline["total_visits"] * 0.03), 20)
+        problem_segments = find_problem_segments(filtered, min_visits=min_visits)
+        if problem_segments.empty:
+            st.info("Сегменты с заметной просадкой CR относительно baseline не найдены.")
+        else:
+            display_cols = [c for c in problem_segments.columns if c != "priority_score"]
+            st.dataframe(problem_segments[display_cols], use_container_width=True, hide_index=True)
+            st.download_button("CSV: проблемные сегменты", csv_bytes(problem_segments[display_cols]), "problem_segments.csv", "text/csv")
+    else:
+        st.info("Сегментный анализ скрыт, потому что выборка слишком маленькая.")
+
+    with st.expander("Технические детали", expanded=not simple_mode):
+        st.caption("Служебные таблицы не нужны для обычного отбора записей и скрыты по умолчанию.")
+        stats = aggregate_stats(filtered)
+        for title, table in stats.items():
+            if not table.empty:
+                st.markdown(f"**{title}**")
+                st.dataframe(table, use_container_width=True, hide_index=True)
+        webvisor_filters = webvisor_filter_table(records_to_watch)
+        if not webvisor_filters.empty:
+            st.markdown("**Что фильтровать в Вебвизоре**")
+            st.dataframe(webvisor_filters, use_container_width=True, hide_index=True)
+        hits_analysis = analyze_hits(st.session_state.get("hits", pd.DataFrame()), filtered)
+        if "warning" in hits_analysis:
+            st.warning(str(hits_analysis["warning"]))
+        else:
+            for title, table in hits_analysis.items():
+                if isinstance(table, pd.DataFrame) and not table.empty:
+                    st.markdown(f"**{title}**")
+                    st.dataframe(table, use_container_width=True, hide_index=True)
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.download_button("CSV: записи", csv_bytes(records_to_watch), "records_export.csv", "text/csv")
+        with c2:
+            st.download_button("CSV: все визиты", csv_bytes(scored), "all_scored_visits.csv", "text/csv")
+        with c3:
+            combined = pd.concat({k: v for k, v in stats.items() if not v.empty}, names=["group"]).reset_index(level=0) if stats else pd.DataFrame()
+            st.download_button("CSV: агрегаты", csv_bytes(combined), "aggregated_stats.csv", "text/csv")
 
 
 try:
